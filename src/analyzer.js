@@ -1,9 +1,17 @@
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import { ethers } from "ethers";
-import erc20Abi from "./abi/ERC20.json" assert { type: "json" };
-import lpAbi from "./abi/LP.json" assert { type: "json" };
-import lockerAbi from "./abi/Locker.json" assert { type: "json" };
 import { tryRead } from "./utils.js";
 import { getTopHolders, detectDevSells } from "./holders.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ✅ Load ABIs safely for Node 16+ (no experimental flags needed)
+const erc20Abi = JSON.parse(fs.readFileSync(path.join(__dirname, "abi", "ERC20.json"), "utf8"));
+const lpAbi = JSON.parse(fs.readFileSync(path.join(__dirname, "abi", "LP.json"), "utf8"));
+const lockerAbi = JSON.parse(fs.readFileSync(path.join(__dirname, "abi", "Locker.json"), "utf8"));
 
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
 
@@ -11,6 +19,7 @@ export async function analyzeToken(tokenAddress) {
   tokenAddress = ethers.getAddress(tokenAddress);
   const token = new ethers.Contract(tokenAddress, erc20Abi, provider);
 
+  // Basic token data
   const [name, symbol, totalSupply, owner] = await Promise.all([
     tryRead(() => token.name()),
     tryRead(() => token.symbol()),
@@ -18,11 +27,14 @@ export async function analyzeToken(tokenAddress) {
     tryRead(() => token.owner())
   ]);
 
+  // Tax checks (if functions exist)
   const buyTax = await tryRead(() => token.buyTax?.());
   const sellTax = await tryRead(() => token.sellTax?.());
 
+  // Try to find LP pair from factory
   let lpInfo = "❌ LP Not Found";
   let lpAddress = null;
+
   try {
     const factory = new ethers.Contract(process.env.FACTORY_ADDRESS, [
       "function allPairsLength() view returns (uint256)",
@@ -35,19 +47,24 @@ export async function analyzeToken(tokenAddress) {
       const lp = new ethers.Contract(pair, lpAbi, provider);
       const token0 = await lp.token0();
       const token1 = await lp.token1();
-      if (token0.toLowerCase() === tokenAddress.toLowerCase() || token1.toLowerCase() === tokenAddress.toLowerCase()) {
+
+      if (
+        token0.toLowerCase() === tokenAddress.toLowerCase() ||
+        token1.toLowerCase() === tokenAddress.toLowerCase()
+      ) {
         lpAddress = pair;
         break;
       }
     }
-  } catch (e) {
-    console.log("LP scan failed:", e);
+  } catch (err) {
+    console.log("⚠️ LP pair scan failed:", err);
   }
 
   if (lpAddress) {
     lpInfo = await analyzeLP(lpAddress);
   }
 
+  // Holders + Dev sell detection
   const holders = await getTopHolders(tokenAddress, provider);
   const devSells = await detectDevSells(tokenAddress, provider);
 
@@ -66,14 +83,22 @@ export async function analyzeToken(tokenAddress) {
 
 async function analyzeLP(lpAddress) {
   const locker = new ethers.Contract(process.env.LOCKER_ADDRESS, lockerAbi, provider);
-  const events = await locker.queryFilter("Locked", 0, "latest");
-  const lock = events.find(e => e.args.token.toLowerCase() === lpAddress.toLowerCase());
 
-  if (lock) {
-    const unlockTime = new Date(Number(lock.args.unlockTime) * 1000);
-    return `✅ Locked until <b>${unlockTime.toUTCString()}</b>`;
+  try {
+    const events = await locker.queryFilter("Locked", 0, "latest");
+    const lock = events.find(
+      (e) => e.args.token.toLowerCase() === lpAddress.toLowerCase()
+    );
+
+    if (lock) {
+      const unlockTime = new Date(Number(lock.args.unlockTime) * 1000);
+      return `✅ Locked until <b>${unlockTime.toUTCString()}</b>`;
+    }
+  } catch (err) {
+    console.log("Locker query failed:", err);
   }
 
+  // Check if LP is burned
   const lp = new ethers.Contract(lpAddress, lpAbi, provider);
   const dead = "0x000000000000000000000000000000000000dEaD";
   const burned = await lp.balanceOf(dead);
@@ -83,8 +108,15 @@ async function analyzeLP(lpAddress) {
 }
 
 function formatReport({ name, symbol, totalSupply, owner, buyTax, sellTax, lpInfo, holders, devSells }) {
-  const topHolders = holders.map(h => `• ${h.address} (${h.percent.toFixed(2)}%)`).join("\n");
-  const devSellNote = devSells.length > 0 ? `🚨 <b>Dev selling detected in last 24h</b>` : "✅ No dev sells in last 24h";
+  const topHolders =
+    holders.length > 0
+      ? holders.map((h) => `• ${h.address} (${h.percent.toFixed(2)}%)`).join("\n")
+      : "N/A";
+
+  const devSellNote =
+    devSells.length > 0
+      ? `🚨 <b>Dev selling detected in last 24h</b>`
+      : "✅ No dev sells in last 24h";
 
   return `
 <b>${name ?? "Unknown Token"} (${symbol ?? "?"})</b>
@@ -96,7 +128,7 @@ function formatReport({ name, symbol, totalSupply, owner, buyTax, sellTax, lpInf
 <b>LP:</b> ${lpInfo}
 
 <b>Top Holders:</b>
-${topHolders || "N/A"}
+${topHolders}
 
 ${devSellNote}
 `;
