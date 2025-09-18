@@ -152,6 +152,7 @@ const LOCKER_ADDRESS = process.env.LOCKER_ADDRESS;
 const ENHANCED_TOKEN_ABI = [
   "event Transfer(address indexed from, address indexed to, uint256 value)",
   "event Approval(address indexed owner, address indexed spender, uint256 value)",
+  "function deployer() view returns (address)",
   "function getOwner() view returns (address)",
   "function owner() view returns (address)",
   "function pair() view returns (address)",
@@ -384,11 +385,45 @@ async function checkContractVerified(address) {
   }
 }
 
+// 🔥 NEW: Fetch deployer directly from contract read functions
+async function fetchDeployer(tokenAddress) {
+  try {
+    const methods = ["deployer", "getOwner", "owner", "admin"];
+    const tokenContract = new ethers.Contract(tokenAddress, [
+      "function deployer() view returns (address)",
+      "function getOwner() view returns (address)",
+      "function owner() view returns (address)",
+      "function admin() view returns (address)"
+    ], provider);
+
+    for (const method of methods) {
+      try {
+        const addr = await tokenContract[method]();
+        if (addr && addr !== ethers.ZeroAddress) {
+          console.log(`✅ Fetched deployer via ${method}: ${addr}`);
+          return addr;
+        }
+      } catch (methodErr) {
+        console.log(`Method ${method} failed:`, methodErr.message);
+      }
+    }
+
+    console.log("⚠️ No deployer found via contract reads");
+    return null;
+  } catch (err) {
+    console.log("Deployer fetch failed:", err.message);
+    return null;
+  }
+}
+
 // 🔥 FIXED: Get contract creation time and deployer for accurate age calculation and lock checking
 async function getContractCreationTime(tokenAddress) {
   let deployer = null;
   try {
     console.log(`🔍 Fetching contract creation time and deployer for ${tokenAddress}`);
+    
+    // First, try contract read for deployer
+    deployer = await fetchDeployer(tokenAddress);
     
     // Try V2 API first for contract creation
     const response = await axios.get(`${BASE_URL}/smart-contracts/${tokenAddress.toLowerCase()}`, {
@@ -403,36 +438,70 @@ async function getContractCreationTime(tokenAddress) {
         blockNumber,
         timestamp: block.timestamp,
         ageHours: Math.floor((Date.now() / 1000 - Number(block.timestamp)) / 3600),
-        deployer: null // V2 doesn't provide deployer directly
+        deployer // Use fetched deployer
       };
     }
     
-    // 🔥 FIXED: Use old API to get contract creation info (deployer and tx hash)
-    const oldBaseUrl = BASE_URL.replace('/v2', '');
-    const creationResponse = await axios.get(`${oldBaseUrl}?module=contract&action=getcontractcreation&contractaddresses=${tokenAddress.toLowerCase()}`, {
+    // Fallback: Try address transactions to find creation
+    const txResponse = await axios.get(`${BASE_URL}/addresses/${tokenAddress.toLowerCase()}/transactions`, {
+      params: { filter: 'creation', limit: 1 },
       timeout: 5000
     });
     
-    if (creationResponse.data && creationResponse.data.status === '1' && creationResponse.data.result && creationResponse.data.result.length > 0) {
-      const creationInfo = creationResponse.data.result[0];
-      deployer = creationInfo.contractcreator;
-      const txHash = creationInfo.tx_hash;
-      
-      // Get block number from tx using v2 API
-      const txResponse = await axios.get(`${BASE_URL}/transactions/${txHash.toLowerCase()}`, {
-        timeout: 5000
-      });
-      
-      if (txResponse.data && txResponse.data.block_number) {
-        const blockNumber = parseInt(txResponse.data.block_number);
-        const block = await provider.getBlock(blockNumber);
-        console.log(`✅ Found creation via old API: block ${blockNumber}, timestamp ${block.timestamp}, deployer ${deployer}`);
-        return {
-          blockNumber,
-          timestamp: block.timestamp,
-          ageHours: Math.floor((Date.now() / 1000 - Number(block.timestamp)) / 3600),
-          deployer
-        };
+    if (txResponse.data && txResponse.data.items && txResponse.data.items.length > 0) {
+      const creationTx = txResponse.data.items[0];
+      const apiDeployer = creationTx.from_hash;
+      deployer = deployer || apiDeployer;
+      const block = await provider.getBlock(creationTx.block_number);
+      console.log(`✅ Found creation via tx: block ${creationTx.block_number}, timestamp ${block.timestamp}, deployer ${deployer}`);
+      return {
+        blockNumber: creationTx.block_number,
+        timestamp: block.timestamp,
+        ageHours: Math.floor((Date.now() / 1000 - Number(block.timestamp)) / 3600),
+        deployer
+      };
+    }
+    
+    // 🔥 NEW: RPC-based fallback to find creation block and deployer
+    console.log("🔍 Using RPC linear search for creation block and deployer");
+    const latestBlockNum = await provider.getBlockNumber();
+    let creationBlockNum = null;
+    let prevCode = "0x";
+    for (let i = 0; i < 5000; i++) {  // Limit search to recent 5000 blocks
+      const blockNum = latestBlockNum - i;
+      if (blockNum < 0) break;
+      try {
+        const code = await provider.getCode(tokenAddress, blockNum);
+        if (code !== "0x" && prevCode === "0x") {
+          creationBlockNum = blockNum;
+          break;
+        }
+        prevCode = code;
+      } catch (err) {
+        console.log(`getCode failed for block ${blockNum}:`, err.message);
+      }
+    }
+
+    if (creationBlockNum !== null) {
+      const block = await provider.getBlock(creationBlockNum);
+      const txHashes = await block.transactions;
+      for (const txHash of txHashes) {
+        try {
+          const receipt = await provider.getTransactionReceipt(txHash);
+          if (receipt && receipt.contractAddress && receipt.contractAddress.toLowerCase() === tokenAddress.toLowerCase()) {
+            const rpcDeployer = receipt.from;
+            deployer = deployer || rpcDeployer;
+            console.log(`✅ Found creation via RPC: block ${creationBlockNum}, tx ${txHash}, deployer ${deployer}`);
+            return {
+              blockNumber: creationBlockNum,
+              timestamp: block.timestamp,
+              ageHours: Math.floor((Date.now() / 1000 - Number(block.timestamp)) / 3600),
+              deployer
+            };
+          }
+        } catch (receiptErr) {
+          console.log(`Receipt fetch failed for ${txHash}:`, receiptErr.message);
+        }
       }
     }
     
@@ -447,7 +516,7 @@ async function getContractCreationTime(tokenAddress) {
       blockNumber: estimatedBlock,
       timestamp: estimatedBlockData.timestamp,
       ageHours: estimatedAgeHours,
-      deployer: null,
+      deployer,
       estimated: true
     };
     
@@ -461,7 +530,7 @@ async function getContractCreationTime(tokenAddress) {
       blockNumber: null,
       timestamp: Math.floor(Date.now() / 1000) - (fallbackAge * 3600),
       ageHours: fallbackAge,
-      deployer: null,
+      deployer,
       estimated: true
     };
   }
@@ -534,7 +603,8 @@ export async function analyzeToken(tokenAddress) {
     const taxes = await analyzeTaxes(tokenContract, tokenInfo.totalSupply);
 
     // --- 5. Liquidity & LP Analysis with FIXED risk ---
-    const liquidity = await analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo, contractCreationInfo.deployer);
+    const deployer = contractCreationInfo.deployer;
+    const liquidity = await analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo, deployer);
 
     // --- 6. Honeypot & Simulation ---
     const simulation = await simulateTrading(tokenAddress, tokenInfo, liquidity);
@@ -696,7 +766,7 @@ async function analyzeOwnership(tokenContract, tokenAddress) {
   let ownershipRisk = "Low";
 
   try {
-    const ownerMethods = ["getOwner", "owner", "admin"];
+    const ownerMethods = ["deployer", "getOwner", "owner", "admin"];
     for (const method of ownerMethods) {
       try {
         owner = await tokenContract[method]();
