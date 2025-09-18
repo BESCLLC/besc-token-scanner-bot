@@ -49,7 +49,7 @@ export async function analyzeToken(tokenAddress) {
       }
     }
 
-    // --- 3. Tax Detection (Honeypot Red Flag if >20%) ---
+    // --- 3. Tax Detection ---
     let buyTax = 0;
     let sellTax = 0;
     const taxFns = [
@@ -73,10 +73,11 @@ export async function analyzeToken(tokenAddress) {
     // --- 4. LP Burn/Lock Status ---
     let lpStatus = "⚠️ LP Not Locked or Burned";
     let lpPercentBurned = 0;
+    let lpPair = null;
     try {
-      const pair = await tokenContract.pair();
-      if (pair && pair !== ethers.ZeroAddress) {
-        const lp = new ethers.Contract(pair, lpAbi, provider);
+      lpPair = await tokenContract.pair();
+      if (lpPair && lpPair !== ethers.ZeroAddress) {
+        const lp = new ethers.Contract(lpPair, lpAbi, provider);
         const lpSupply = await lp.totalSupply();
 
         const deadBalance = await lp.balanceOf("0x000000000000000000000000000000000000dEaD");
@@ -86,7 +87,7 @@ export async function analyzeToken(tokenAddress) {
           lpStatus = `🔥 LP Burned (${lpPercentBurned.toFixed(2)}%)`;
         } else {
           const locker = new ethers.Contract(LOCKER_ADDRESS, lockerAbi, provider);
-          const locks = await locker.getUserLocks(pair);
+          const locks = await locker.getUserLocks(lpPair);
           if (locks && locks.length > 0) {
             const unlockTime = Math.max(...locks.map((l) => Number(l.unlockTime)));
             const unlockDate = new Date(unlockTime * 1000);
@@ -105,13 +106,10 @@ export async function analyzeToken(tokenAddress) {
       tokenInfo.totalSupply,
       tokenInfo.decimals
     );
-
-    // Display only top 7 holders but keep full list for risk + top 10 %
     const topHoldersDisplay = holders.slice(0, 7);
     let holdersText = topHoldersDisplay.length
       ? topHoldersDisplay.map((h) => `• ${h.label || `<code>${h.address}</code>`} (${h.percent.toFixed(2)}%)`).join("\n")
       : "No holder data found.";
-
     if (holders.length > 0) {
       const top10Percent = holders.slice(0, 10).reduce((sum, h) => sum + h.percent, 0);
       holdersText += `\n\n<b>Top 10 Holders Own:</b> ${top10Percent.toFixed(2)}% of Supply`;
@@ -137,11 +135,10 @@ export async function analyzeToken(tokenAddress) {
       }
     }
 
-    // --- 7. Honeypot Simulation (Improved) ---
-    let honeypotRisk = "✅ Sell transactions simulated successfully";
+    // --- 7. Honeypot Simulation (DEX-aware) ---
+    let honeypotRisk = "✅ Sell simulation succeeded";
     try {
       const testWallet = ethers.Wallet.createRandom().address;
-      // Small amount test
       await provider.call({
         to: tokenAddress,
         data: tokenContract.interface.encodeFunctionData("transfer", [
@@ -149,20 +146,29 @@ export async function analyzeToken(tokenAddress) {
           1n
         ])
       });
-    } catch {
-      // Retry with a normal amount if small transfer fails
+    } catch (transferErr) {
+      console.log("Direct transfer failed, trying DEX swap simulation...");
       try {
-        const normalAmount = ethers.parseUnits("1", tokenInfo.decimals);
-        await provider.call({
-          to: tokenAddress,
-          data: tokenContract.interface.encodeFunctionData("transfer", [
-            ethers.Wallet.createRandom().address,
-            normalAmount
-          ])
-        });
-        honeypotRisk = "ℹ️ Dust trades blocked — normal sells pass ✅";
-      } catch {
-        honeypotRisk = "🛑 Possible Honeypot — Sell transfer simulation failed!";
+        if (lpPair) {
+          const lp = new ethers.Contract(lpPair, lpAbi, provider);
+          const token0 = await lp.token0();
+          const token1 = await lp.token1();
+          const path = [tokenAddress, token0 === tokenAddress ? token1 : token0];
+          // Minimal encoded data for a swap simulation (no actual execution)
+          const swapIface = new ethers.Interface([
+            "function swapExactTokensForTokensSupportingFeeOnTransferTokens(uint amountIn, uint amountOutMin, address[] path, address to, uint deadline)"
+          ]);
+          const callData = swapIface.encodeFunctionData(
+            "swapExactTokensForTokensSupportingFeeOnTransferTokens",
+            [ethers.parseUnits("1", tokenInfo.decimals), 0, path, testWallet, Math.floor(Date.now() / 1000) + 60]
+          );
+          await provider.call({ to: lpPair, data: callData });
+          honeypotRisk = "✅ Swap simulation passed (DEX sell possible)";
+        } else {
+          honeypotRisk = "⚠️ Could not find LP pair — cannot simulate sell.";
+        }
+      } catch (dexErr) {
+        honeypotRisk = "🛑 Possible Honeypot — Swap simulation reverted!";
       }
     }
 
@@ -202,7 +208,6 @@ export async function analyzeToken(tokenAddress) {
   }
 }
 
-/** --- Risk Calculator --- */
 function calculateRisk({ buyTax, sellTax, lpPercentBurned, holders }) {
   let score = 0;
   let holderComment = "Healthy";
@@ -236,7 +241,6 @@ function calculateRisk({ buyTax, sellTax, lpPercentBurned, holders }) {
   };
 }
 
-/** --- Contract Verification Checker --- */
 async function checkContractVerified(address) {
   try {
     const res = await axios.get(`${BASE_URL}/smart-contracts/${address}`);
