@@ -255,6 +255,15 @@ function calculateRisk({ buyTax, sellTax, lpPercentBurned, holders }) {
   let lpComment = "Sufficiently burned/locked";
   let traderInsights = "Token looks safe for trading.";
 
+  // ✅ Exclude dead/zero addresses before checking whale %
+  const filteredHolders = holders.filter(
+    (h) =>
+      !h.address.toLowerCase().includes("dead") &&
+      h.address.toLowerCase() !== "0x0000000000000000000000000000000000000000"
+  );
+
+  const biggestHolder = filteredHolders.length > 0 ? filteredHolders[0] : null;
+
   if (buyTax > 10 || sellTax > 10) {
     score += 2;
     taxComment = "⚠️ High tax - possible honeypot.";
@@ -263,9 +272,9 @@ function calculateRisk({ buyTax, sellTax, lpPercentBurned, holders }) {
     score += 2;
     lpComment = "⚠️ Low burn/lock - liquidity can be removed.";
   }
-  if (holders.length > 0 && holders[0].percent > 30) {
+  if (biggestHolder && biggestHolder.percent > 30) {
     score += 2;
-    holderComment = "⚠️ Whale holds >30% supply.";
+    holderComment = `⚠️ Whale holds >${biggestHolder.percent.toFixed(2)}% supply.`;
   }
 
   if (score >= 4) traderInsights = "High rug risk — trade cautiously.";
