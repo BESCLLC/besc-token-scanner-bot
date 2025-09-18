@@ -384,10 +384,11 @@ async function checkContractVerified(address) {
   }
 }
 
-// 🔥 FIXED: Get contract creation time for accurate age calculation
+// 🔥 FIXED: Get contract creation time and deployer for accurate age calculation and lock checking
 async function getContractCreationTime(tokenAddress) {
+  let deployer = null;
   try {
-    console.log(`🔍 Fetching contract creation time for ${tokenAddress}`);
+    console.log(`🔍 Fetching contract creation time and deployer for ${tokenAddress}`);
     
     // Try V2 API first for contract creation
     const response = await axios.get(`${BASE_URL}/smart-contracts/${tokenAddress.toLowerCase()}`, {
@@ -401,7 +402,8 @@ async function getContractCreationTime(tokenAddress) {
       return {
         blockNumber,
         timestamp: block.timestamp,
-        ageHours: Math.floor((Date.now() / 1000 - Number(block.timestamp)) / 3600)
+        ageHours: Math.floor((Date.now() / 1000 - Number(block.timestamp)) / 3600),
+        deployer: null // V2 doesn't provide deployer directly
       };
     }
     
@@ -413,12 +415,14 @@ async function getContractCreationTime(tokenAddress) {
     
     if (txResponse.data && txResponse.data.items && txResponse.data.items.length > 0) {
       const creationTx = txResponse.data.items[0];
+      deployer = creationTx.from_hash;
       const block = await provider.getBlock(creationTx.block_number);
-      console.log(`✅ Found creation via tx: block ${creationTx.block_number}, timestamp ${block.timestamp}`);
+      console.log(`✅ Found creation via tx: block ${creationTx.block_number}, timestamp ${block.timestamp}, deployer ${deployer}`);
       return {
         blockNumber: creationTx.block_number,
         timestamp: block.timestamp,
-        ageHours: Math.floor((Date.now() / 1000 - Number(block.timestamp)) / 3600)
+        ageHours: Math.floor((Date.now() / 1000 - Number(block.timestamp)) / 3600),
+        deployer
       };
     }
     
@@ -433,6 +437,7 @@ async function getContractCreationTime(tokenAddress) {
       blockNumber: estimatedBlock,
       timestamp: estimatedBlockData.timestamp,
       ageHours: estimatedAgeHours,
+      deployer: null,
       estimated: true
     };
     
@@ -446,6 +451,7 @@ async function getContractCreationTime(tokenAddress) {
       blockNumber: null,
       timestamp: Math.floor(Date.now() / 1000) - (fallbackAge * 3600),
       ageHours: fallbackAge,
+      deployer: null,
       estimated: true
     };
   }
@@ -495,7 +501,7 @@ export async function analyzeToken(tokenAddress) {
     const tokenInfo = await fetchTokenInfoFromBlockscout(tokenAddress);
     console.log(`Token info loaded: ${tokenInfo.name} (${tokenInfo.symbol}), Supply: ${tokenInfo.totalSupply.toString()}, Holders: ${tokenInfo.holdersCount}`);
     
-    // 🔥 FIXED: Get accurate contract creation time instead of pair time
+    // 🔥 FIXED: Get accurate contract creation time and deployer
     const contractCreationInfo = await getContractCreationTime(tokenAddress);
     
     const contractAnalysis = await analyzeContractFeatures(tokenAddress);
@@ -518,7 +524,7 @@ export async function analyzeToken(tokenAddress) {
     const taxes = await analyzeTaxes(tokenContract, tokenInfo.totalSupply);
 
     // --- 5. Liquidity & LP Analysis with FIXED risk ---
-    const liquidity = await analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo);
+    const liquidity = await analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo, contractCreationInfo.deployer);
 
     // --- 6. Honeypot & Simulation ---
     const simulation = await simulateTrading(tokenAddress, tokenInfo, liquidity);
@@ -854,8 +860,8 @@ function calculateGiniCoefficient(holders) {
   return Math.abs(accumulator);
 }
 
-// 🔥 FIXED: Liquidity analysis with better error handling
-async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo) {
+// 🔥 FIXED: Liquidity analysis with better error handling and deployer-based lock check
+async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo, deployer) {
   let lpStatus = "⚠️ No LP found";
   let lpPercentBurned = 0;
   let lpPair = null;
@@ -895,7 +901,7 @@ async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo) {
 
       // === REAL LOCKER CHECKING ===
       if (LOCKER_ADDRESS) {
-        const lockStatus = await checkLockerStatus(lpPair, lpSupply);
+        const lockStatus = await checkLockerStatus(lpPair, lpSupply, deployer);
         if (lockStatus.locked) {
           lpLocked = true;
           lockedAmount = lockStatus.lockedAmount;
@@ -959,39 +965,52 @@ async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo) {
   };
 }
 
-// 🔥 FIXED: Event-based locker status checking with smaller range and batch size
-async function checkLockerStatus(lpPair, totalLPSupply) {
+// 🔥 FIXED: Event-based locker status checking by deployer wallet (user filter) to avoid large ranges
+async function checkLockerStatus(lpPair, totalLPSupply, deployer) {
   try {
     if (!LOCKER_ADDRESS) {
       return { locked: false, lockedAmount: 0n, lockedPercent: 0, unlockTime: 0, unlockDate: "N/A" };
     }
 
-    console.log(`🔍 Checking locker status for LP: ${lpPair} via events`);
+    console.log(`🔍 Checking locker status for LP: ${lpPair} via deployer ${deployer || 'unknown'}`);
     
     const lockerContract = new ethers.Contract(LOCKER_ADDRESS, LOCKER_ABI, provider);
     
-    // 🔥 FIXED: Even smaller range - last 10000 blocks (~1-2 days) for recent locks
-    const latestBlockNum = await provider.getBlockNumber();
-    const fromBlockNum = Math.max(0, latestBlockNum - 10000);
-    console.log(`Querying events from block ${fromBlockNum} to ${latestBlockNum}`);
-    
-    // 🔥 FIXED: Use batched querying with smaller initial batch
-    const filter = lockerContract.filters.Locked(null, null, null, lpPair, null, null);
-    const lockedEvents = await queryEventsInBatches(lockerContract, filter, fromBlockNum, latestBlockNum);
-    
-    console.log(`Found ${lockedEvents.length} Locked events for LP ${lpPair}`);
+    let lockedEvents = [];
+    if (deployer) {
+      // 🔥 FIXED: Filter by user (deployer) - indexed first param, query from 0 to latest (few events per user)
+      console.log(`Filtering Locked events by deployer: ${deployer}`);
+      const filter = lockerContract.filters.Locked(deployer);
+      lockedEvents = await lockerContract.queryFilter(filter, 0, "latest");
+      console.log(`Found ${lockedEvents.length} Locked events by deployer ${deployer}`);
+    } else {
+      // Fallback if no deployer: use small recent range on token
+      console.log("No deployer found, falling back to recent token filter");
+      const latestBlockNum = await provider.getBlockNumber();
+      const fromBlockNum = Math.max(0, latestBlockNum - 10000);
+      const filter = lockerContract.filters.Locked(null, null, null, lpPair, null, null);
+      lockedEvents = await queryEventsInBatches(lockerContract, filter, fromBlockNum, latestBlockNum);
+    }
 
     let totalLockedAmount = 0n;
     let earliestUnlockTime = 0;
     let hasActiveLocks = false;
 
     // Get current timestamp
+    const latestBlockNum = await provider.getBlockNumber();
     const currentTimestamp = (await provider.getBlock(latestBlockNum)).timestamp;
 
     // Process each event
     for (const event of lockedEvents) {
       const user = event.args.user;
       const lockId = Number(event.args.lockId);
+      const eventToken = event.args.token;
+
+      // Only process if token matches LP pair
+      if (eventToken.toLowerCase() !== lpPair.toLowerCase()) {
+        console.log(`Skipping non-LP lock: token ${eventToken} != ${lpPair}`);
+        continue;
+      }
 
       try {
         // Fetch user's locks to check current status
@@ -999,7 +1018,7 @@ async function checkLockerStatus(lpPair, totalLPSupply) {
         
         if (lockId < userLocks.length) {
           const lock = userLocks[lockId];
-          if (!lock.unlocked && lock.token.toLowerCase() === lpPair.toLowerCase() && currentTimestamp < lock.unlockTime) {
+          if (!lock.unlocked && currentTimestamp < lock.unlockTime) {
             hasActiveLocks = true;
             totalLockedAmount += lock.amount;
             
@@ -1007,7 +1026,7 @@ async function checkLockerStatus(lpPair, totalLPSupply) {
               earliestUnlockTime = Number(lock.unlockTime);
             }
             
-            console.log(`Active lock found: User ${user}, ID ${lockId}, Amount ${ethers.formatEther(lock.amount)}, Unlock ${new Date(lock.unlockTime * 1000).toLocaleDateString()}`);
+            console.log(`Active LP lock found: User ${user}, ID ${lockId}, Amount ${ethers.formatEther(lock.amount)}, Unlock ${new Date(lock.unlockTime * 1000).toLocaleDateString()}`);
           }
         }
       } catch (userErr) {
@@ -1031,7 +1050,7 @@ async function checkLockerStatus(lpPair, totalLPSupply) {
       };
     }
 
-    console.log("No active locks found for this LP");
+    console.log("No active LP locks found");
     return { 
       locked: false, 
       lockedAmount: 0n, 
