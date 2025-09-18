@@ -1003,8 +1003,6 @@ function getTradingRecommendation(riskPercentage) {
   return "🔴 Extreme risk - avoid or use minimal position size";
 }
 
-// Export for testing
-export { calculateRisk as legacyCalculateRisk } from './legacy-risk.js'; // If you want to keep old function
 
 // Default export for backward compatibility
 export default { analyzeToken };
