@@ -1,27 +1,48 @@
-import TelegramBot from 'node-telegram-bot-api';
-import { analyzeToken } from './analyzer.js';
+import TelegramBot from "node-telegram-bot-api";
+import dotenv from "dotenv";
+import { analyzeToken } from "./analyzer.js";
 
-export function startBot() {
-  const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
+dotenv.config();
 
-  bot.onText(/\/start/, (msg) => {
-    bot.sendMessage(msg.chat.id, "👋 Send me a token address to analyze. Works here or in any group chat.");
-  });
-
-  bot.on("message", async (msg) => {
-    const text = msg.text?.trim();
-    if (!text || text.startsWith("/")) return;
-
-    await bot.sendChatAction(msg.chat.id, "typing");
-
-    try {
-      const result = await analyzeToken(text);
-      bot.sendMessage(msg.chat.id, result, { parse_mode: "HTML" });
-    } catch (e) {
-      console.error("Analysis error:", e);
-      bot.sendMessage(msg.chat.id, "⚠️ Could not analyze this token. Double-check the address.");
-    }
-  });
-
-  console.log("✅ Bot running and listening for messages...");
+const token = process.env.BOT_TOKEN;
+if (!token) {
+  console.error("❌ BOT_TOKEN missing in environment!");
+  process.exit(1);
 }
+
+// Create polling bot
+console.log("🚀 Starting BESC Token Scanner bot...");
+const bot = new TelegramBot(token, { polling: true });
+
+bot.on("polling_error", (err) => console.error("⚠️ Polling error:", err.message));
+
+// Welcome message for /start
+bot.onText(/\/start/, (msg) => {
+  console.log(`✅ /start from ${msg.chat.id}`);
+  bot.sendMessage(
+    msg.chat.id,
+    "👋 Welcome to BESC Token Scanner!\n\nSend me a token contract address and I will:\n" +
+      "• Fetch supply & decimals\n" +
+      "• Show top holders (from BlockScout)\n" +
+      "• Check LP status (burn/lock %)\n" +
+      "• Detect dev sells in last 24h\n" +
+      "• Show buy/sell tax if available"
+  );
+});
+
+// Handle all other messages
+bot.on("message", async (msg) => {
+  if (!msg.text || msg.text.startsWith("/")) return; // ignore commands except /start
+  const chatId = msg.chat.id;
+  const text = msg.text.trim();
+
+  try {
+    console.log(`🔎 Analyzing ${text}`);
+    await bot.sendMessage(chatId, "⏳ Analyzing token...");
+    const result = await analyzeToken(text);
+    await bot.sendMessage(chatId, result, { parse_mode: "HTML" });
+  } catch (err) {
+    console.error("❌ Analysis failed:", err);
+    await bot.sendMessage(chatId, "⚠️ Error analyzing token. Check Railway logs.");
+  }
+});
