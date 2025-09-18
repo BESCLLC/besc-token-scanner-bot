@@ -306,23 +306,31 @@ export async function getFixedTopHolders(tokenAddress, limit = 100, totalSupply,
   }
 }
 
-// 🔥 FIXED: V2 Blockscout API - Proper contract verification
+// 🔥 FIXED: V2 Blockscout API - Proper contract verification using Etherscan-compatible endpoint
 async function checkContractVerified(address) {
   try {
-    // ✅ FIXED: Use V2 endpoint - /smart-contracts/{address_hash}
-    const response = await axios.get(`${BASE_URL}/smart-contracts/${address.toLowerCase()}`, {
+    // ✅ FIXED: Use Etherscan-compatible API since V2 smart-contracts endpoint may require module/action params
+    const apiUrl = BASE_URL.replace('/v2', ''); // Remove /v2 to use base API
+    const response = await axios.get(`${apiUrl}?module=contract&action=getsourcecode&address=${address.toLowerCase()}`, {
       timeout: 5000
     });
     
-    console.log("Contract verification V2 response:", response.status);
+    console.log("Contract verification Etherscan API response:", response.status);
+    console.log("Response data:", JSON.stringify(response.data, null, 2));
     
-    return response.data && 
-           response.status === 200 && 
-           response.data.verified && 
-           response.data.verified === true;
+    // Check Etherscan API response format
+    if (response.data && response.data.status === '1' && 
+        response.data.result && Array.isArray(response.data.result) && 
+        response.data.result.length > 0 && 
+        response.data.result[0].SourceCode && 
+        response.data.result[0].SourceCode !== '') {
+      return true;
+    }
+    
+    return false;
   } catch (err) {
     if (err.response && err.response.status === 404) {
-      console.log(`Contract ${address} not verified on Blockscout V2`);
+      console.log(`Contract ${address} not found/verified on explorer`);
     } else {
       console.log(`Contract verification failed for ${address}:`, err.message);
     }
@@ -867,7 +875,7 @@ async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo) {
   };
 }
 
-// Real locker status checking using your ABI
+// 🔥 FIXED: Real locker status checking - Use locker owner as user for getUserLocks, then filter by LP token
 async function checkLockerStatus(lpPair, totalLPSupply) {
   try {
     if (!LOCKER_ADDRESS) {
@@ -878,9 +886,18 @@ async function checkLockerStatus(lpPair, totalLPSupply) {
     
     const lockerContract = new ethers.Contract(LOCKER_ADDRESS, LOCKER_ABI, provider);
     
-    const userLocks = await lockerContract.getUserLocks(lpPair);
+    // 🔥 FIXED: Get locks from the locker owner (likely the deployer who locked the LP)
+    const lockerOwner = await lockerContract.owner().catch(() => ethers.ZeroAddress);
+    console.log(`Locker owner: ${lockerOwner}`);
     
-    console.log(`Found ${userLocks.length} locks for LP ${lpPair}`);
+    if (lockerOwner === ethers.ZeroAddress) {
+      console.log("Could not fetch locker owner, skipping lock check");
+      return { locked: false, lockedAmount: 0n, lockedPercent: 0, unlockTime: 0, unlockDate: "N/A" };
+    }
+    
+    const userLocks = await lockerContract.getUserLocks(lockerOwner);
+    
+    console.log(`Found ${userLocks.length} locks for locker owner ${lockerOwner}`);
 
     let totalLockedAmount = 0n;
     let earliestUnlockTime = 0;
