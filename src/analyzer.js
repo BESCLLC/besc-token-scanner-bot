@@ -451,6 +451,42 @@ async function getContractCreationTime(tokenAddress) {
   }
 }
 
+// 🔥 NEW: Batched event querying to avoid RPC range limits
+async function queryEventsInBatches(contract, filter, fromBlock, toBlock, batchSize = 10000) {
+  let allEvents = [];
+  let currentFrom = BigInt(fromBlock);
+  const toBlockNum = BigInt(toBlock === 'latest' ? await provider.getBlockNumber() : toBlock);
+
+  console.log(`🔍 Starting batched query: from ${fromBlock} to ${toBlock}, batch size ${batchSize}`);
+
+  while (currentFrom < toBlockNum) {
+    const currentTo = currentFrom + BigInt(batchSize);
+    const actualTo = currentTo > toBlockNum ? toBlockNum : currentTo;
+
+    try {
+      console.log(`📦 Querying batch: ${currentFrom} to ${actualTo}`);
+      const events = await contract.queryFilter(filter, Number(currentFrom), Number(actualTo));
+      allEvents = allEvents.concat(events);
+      console.log(`✅ Batch complete: ${events.length} events found`);
+    } catch (batchErr) {
+      console.error(`❌ Batch failed from ${currentFrom} to ${actualTo}:`, batchErr.message);
+      // If batch fails, try smaller batch or skip
+      if (batchSize > 1000) {
+        // Recurse with smaller batch size
+        const smallerBatch = await queryEventsInBatches(contract, filter, Number(currentFrom), Number(actualTo), batchSize / 2);
+        allEvents = allEvents.concat(smallerBatch);
+      } else {
+        console.log(`⚠️ Skipping problematic batch ${currentFrom}-${actualTo}`);
+      }
+    }
+
+    currentFrom = actualTo + 1n;
+  }
+
+  console.log(`✅ Total events collected: ${allEvents.length}`);
+  return allEvents;
+}
+
 export async function analyzeToken(tokenAddress) {
   try {
     console.log(`🔍 Analyzing token: ${tokenAddress}`);
@@ -923,7 +959,7 @@ async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo) {
   };
 }
 
-// 🔥 FIXED: Event-based locker status checking to find all locks for the LP token - Limited block range to avoid RPC limits
+// 🔥 FIXED: Event-based locker status checking with batched queries to handle RPC limits
 async function checkLockerStatus(lpPair, totalLPSupply) {
   try {
     if (!LOCKER_ADDRESS) {
@@ -934,14 +970,14 @@ async function checkLockerStatus(lpPair, totalLPSupply) {
     
     const lockerContract = new ethers.Contract(LOCKER_ADDRESS, LOCKER_ABI, provider);
     
-    // 🔥 FIXED: Limit block range to avoid "Requested range exceeds maximum RPC range limit"
+    // 🔥 FIXED: Reduced initial range to recent blocks (50k ~5-6 days) and use batching
     const latestBlockNum = await provider.getBlockNumber();
-    const fromBlockNum = Math.max(0, latestBlockNum - 100000); // Covers ~11 days at 12s/block, adjustable if needed
+    const fromBlockNum = Math.max(0, latestBlockNum - 50000); // Smaller initial range for faster checks
     console.log(`Querying events from block ${fromBlockNum} to ${latestBlockNum}`);
     
-    // 🔥 FIXED: Query Locked events filtered by token = lpPair (correct parameter position: 4th arg for indexed token)
+    // 🔥 FIXED: Use batched querying
     const filter = lockerContract.filters.Locked(null, null, null, lpPair, null, null);
-    const lockedEvents = await lockerContract.queryFilter(filter, fromBlockNum, "latest");
+    const lockedEvents = await queryEventsInBatches(lockerContract, filter, fromBlockNum, latestBlockNum);
     
     console.log(`Found ${lockedEvents.length} Locked events for LP ${lpPair}`);
 
@@ -1007,6 +1043,7 @@ async function checkLockerStatus(lpPair, totalLPSupply) {
 
   } catch (err) {
     console.log("Locker status check failed:", err.message);
+    // Fallback to unlocked status on error
     return { 
       locked: false, 
       lockedAmount: 0n, 
