@@ -34,14 +34,13 @@ export async function getTokenInfo(tokenAddress) {
 
 /**
  * Fetch top token holders from BlockScout API with pagination.
- * Tags LP, burn address, and contracts for readability.
+ * Normalizes address field, tags LP/Burn addresses, sorts by balance.
  */
 export async function getTopHolders(tokenAddress, limit = 10, totalSupply, decimals) {
   try {
     const url = `${BASE_URL}/tokens/${tokenAddress}/holders?page=1&limit=${limit}`;
     const res = await axios.get(url);
 
-    // Debug log to see exactly what the explorer returns
     if (process.env.DEBUG === "true") {
       console.log("📡 BlockScout Holders API Raw:", JSON.stringify(res.data, null, 2));
     }
@@ -52,15 +51,20 @@ export async function getTopHolders(tokenAddress, limit = 10, totalSupply, decim
     }
 
     const holders = res.data.items.map((h) => {
-      // Fallback to decimals = 18 if explorer doesn't return value in correct format
+      // Normalize address regardless of format
+      let addr =
+        typeof h.address === "string"
+          ? h.address
+          : h.address?.hash || h.address?.address || "Unknown";
+
       const balance = Number(ethers.formatUnits(h.value || "0", decimals || 18));
       const percent = totalSupply > 0 ? (balance / totalSupply) * 100 : 0;
 
-      let label = h.address;
-      if (h.address.toLowerCase() === "0x000000000000000000000000000000000000dead") {
+      let label = addr;
+      if (addr.toLowerCase() === "0x000000000000000000000000000000000000dead") {
         label = "🔥 Burn Address";
       }
-      if (h.name && h.name.toLowerCase().includes("sushi")) {
+      if (h.name && typeof h.name === "string" && h.name.toLowerCase().includes("sushi")) {
         label = "🍣 SushiSwap LP Token";
       }
       if (h.is_contract) {
@@ -69,13 +73,12 @@ export async function getTopHolders(tokenAddress, limit = 10, totalSupply, decim
 
       return {
         address: label,
-        rawAddress: h.address,
+        rawAddress: addr,
         balance,
         percent
       };
     });
 
-    // Sort descending by balance
     return holders.sort((a, b) => b.balance - a.balance);
   } catch (err) {
     console.error("❌ getTopHolders failed:", err.message);
