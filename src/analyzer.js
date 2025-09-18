@@ -451,8 +451,8 @@ async function getContractCreationTime(tokenAddress) {
   }
 }
 
-// 🔥 NEW: Batched event querying to avoid RPC range limits
-async function queryEventsInBatches(contract, filter, fromBlock, toBlock, batchSize = 10000) {
+// 🔥 FIXED: Batched event querying with smaller initial batch size to avoid RPC limits
+async function queryEventsInBatches(contract, filter, fromBlock, toBlock, batchSize = 1000) {
   let allEvents = [];
   let currentFrom = BigInt(fromBlock);
   const toBlockNum = BigInt(toBlock === 'latest' ? await provider.getBlockNumber() : toBlock);
@@ -471,12 +471,12 @@ async function queryEventsInBatches(contract, filter, fromBlock, toBlock, batchS
     } catch (batchErr) {
       console.error(`❌ Batch failed from ${currentFrom} to ${actualTo}:`, batchErr.message);
       // If batch fails, try smaller batch or skip
-      if (batchSize > 1000) {
+      if (batchSize > 500) {
         // Recurse with smaller batch size
         const smallerBatch = await queryEventsInBatches(contract, filter, Number(currentFrom), Number(actualTo), batchSize / 2);
         allEvents = allEvents.concat(smallerBatch);
       } else {
-        console.log(`⚠️ Skipping problematic batch ${currentFrom}-${actualTo}`);
+        console.log(`⚠️ Skipping problematic batch ${currentFrom}-${actualTo} (batch size too small)`);
       }
     }
 
@@ -959,7 +959,7 @@ async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo) {
   };
 }
 
-// 🔥 FIXED: Event-based locker status checking with batched queries to handle RPC limits
+// 🔥 FIXED: Event-based locker status checking with smaller range and batch size
 async function checkLockerStatus(lpPair, totalLPSupply) {
   try {
     if (!LOCKER_ADDRESS) {
@@ -970,12 +970,12 @@ async function checkLockerStatus(lpPair, totalLPSupply) {
     
     const lockerContract = new ethers.Contract(LOCKER_ADDRESS, LOCKER_ABI, provider);
     
-    // 🔥 FIXED: Reduced initial range to recent blocks (50k ~5-6 days) and use batching
+    // 🔥 FIXED: Even smaller range - last 10000 blocks (~1-2 days) for recent locks
     const latestBlockNum = await provider.getBlockNumber();
-    const fromBlockNum = Math.max(0, latestBlockNum - 50000); // Smaller initial range for faster checks
+    const fromBlockNum = Math.max(0, latestBlockNum - 10000);
     console.log(`Querying events from block ${fromBlockNum} to ${latestBlockNum}`);
     
-    // 🔥 FIXED: Use batched querying
+    // 🔥 FIXED: Use batched querying with smaller initial batch
     const filter = lockerContract.filters.Locked(null, null, null, lpPair, null, null);
     const lockedEvents = await queryEventsInBatches(lockerContract, filter, fromBlockNum, latestBlockNum);
     
