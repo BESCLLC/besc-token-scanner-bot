@@ -1342,6 +1342,5 @@ function calculateRisk({ buyTax, sellTax, lpPercentBurned, holders }) {
   };
 }
 
-// Export both functions for flexibility
-export { calculateRisk };
+
 export default { analyzeToken };
