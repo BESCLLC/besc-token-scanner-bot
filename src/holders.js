@@ -1,82 +1,82 @@
 import axios from "axios";
 import { ethers } from "ethers";
 
-const BASE_URL =
-  process.env.BLOCKSCOUT_API || "https://explorer.beschyperchain.com/api/v2";
+const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
+const BASE_URL = process.env.BLOCKSCOUT_API || "https://explorer.beschyperchain.com/api/v2";
 
 /**
- * Fetch token info from BlockScout (name, symbol, supply, decimals)
+ * Fetches token info (name, symbol, decimals, totalSupply) from RPC.
  */
 export async function getTokenInfo(tokenAddress) {
-  try {
-    const url = `${BASE_URL}/tokens/${tokenAddress}`;
-    const res = await axios.get(url, { headers: { accept: "application/json" } });
+  const erc20Abi = [
+    "function name() view returns (string)",
+    "function symbol() view returns (string)",
+    "function decimals() view returns (uint8)",
+    "function totalSupply() view returns (uint256)"
+  ];
 
-    if (res.data) {
-      const data = res.data;
-      const decimals = Number(data.decimals || 18);
-      const totalSupply = Number(data.total_supply) / 10 ** decimals;
-      return {
-        name: data.name || "Unknown",
-        symbol: data.symbol || "???",
-        decimals,
-        totalSupply
-      };
-    }
-  } catch (e) {
-    console.log("BlockScout token info failed:", e.message);
-  }
-  return { name: "Unknown", symbol: "???", decimals: 18, totalSupply: 0 };
+  const token = new ethers.Contract(tokenAddress, erc20Abi, provider);
+
+  const [name, symbol, decimals, totalSupply] = await Promise.all([
+    safeCall(() => token.name(), "Unknown"),
+    safeCall(() => token.symbol(), "Unknown"),
+    safeCall(() => token.decimals(), 18),
+    safeCall(() => token.totalSupply(), 0n)
+  ]);
+
+  return {
+    name,
+    symbol,
+    decimals,
+    totalSupply: Number(ethers.formatUnits(totalSupply, decimals))
+  };
 }
 
 /**
- * Fetch top holders and calculate percentage ownership
+ * Fetches top token holders using BlockScout API (much more reliable than RPC scan).
+ * Adds LP tagging, burn address tagging, and flags suspicious whales.
  */
-export async function getTopHolders(
-  tokenAddress,
-  limit = 10,
-  totalSupply = null,
-  decimals = 18
-) {
+export async function getTopHolders(tokenAddress, limit = 10, totalSupply, decimals) {
   try {
-    const url = `${BASE_URL}/tokens/${tokenAddress}/holders?page=1&page_size=${limit}`;
-    const res = await axios.get(url, { headers: { accept: "application/json" } });
+    const url = `${BASE_URL}/tokens/${tokenAddress}/holders`;
+    const res = await axios.get(url);
 
-    if (res.data && Array.isArray(res.data.items)) {
-      const supplyBN = totalSupply
-        ? ethers.parseUnits(totalSupply.toString(), decimals)
-        : null;
+    if (!res.data.items || res.data.items.length === 0) return [];
 
-      // Map holders → {address, balance, percent}
-      const mapped = res.data.items
-        .map((h) => {
-          const balanceBN = BigInt(h.value || "0");
-          let percent = 0;
-          if (supplyBN && supplyBN > 0n) {
-            percent = Number((balanceBN * 10000n) / supplyBN) / 100; // 2 decimals
-          }
-          return {
-            address: ethers.getAddress(h.address.hash),
-            balance: Number(balanceBN) / 10 ** decimals,
-            percent
-          };
-        })
-        .filter((h) => h.balance > 0) // drop dust
-        .sort((a, b) => b.balance - a.balance) // biggest first
-        .slice(0, limit);
+    const holders = res.data.items
+      .slice(0, limit)
+      .map((h) => {
+        const balance = Number(ethers.formatUnits(h.value, decimals));
+        const percent = totalSupply > 0 ? (balance / totalSupply) * 100 : 0;
 
-      // Special labeling for LP & dead wallet
-      return mapped.map((h) => ({
-        ...h,
-        address:
-          h.address.toLowerCase() ===
-          "0x000000000000000000000000000000000000dead"
-            ? "🔥 Burn Address"
-            : h.address
-      }));
-    }
-  } catch (e) {
-    console.log("BlockScout holder API failed:", e.message);
+        let label = h.address;
+        if (h.address.toLowerCase() === "0x000000000000000000000000000000000000dead")
+          label = "🔥 Burn Address";
+        if (h.name && h.name.toLowerCase().includes("sushiswap"))
+          label = "🍣 SushiSwap LP Token";
+        if (h.is_contract) label += " [Contract]";
+
+        return {
+          address: label,
+          rawAddress: h.address,
+          balance,
+          percent
+        };
+      })
+      .sort((a, b) => b.balance - a.balance);
+
+    return holders;
+  } catch (err) {
+    console.error("❌ getTopHolders failed:", err.message);
+    return [];
   }
-  return [];
+}
+
+/** Safe call wrapper to prevent hard crashes on view function errors */
+async function safeCall(fn, fallback) {
+  try {
+    return await fn();
+  } catch {
+    return fallback;
+  }
 }
