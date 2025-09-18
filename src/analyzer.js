@@ -133,7 +133,7 @@ const ENHANCED_TOKEN_ABI = [
   "function burn(uint256) external"
 ];
 
-// 🔥 FIXED: V2 Blockscout API - Proper token info endpoint
+// 🔥 FIXED: V2 Blockscout API - Proper token info endpoint with holders count
 async function fetchTokenInfoFromBlockscout(tokenAddress) {
   try {
     console.log(`🔍 Fetching token info from Blockscout V2: ${tokenAddress}`);
@@ -172,11 +172,16 @@ async function fetchTokenInfoFromBlockscout(tokenAddress) {
         }
       }
 
+      // ✅ FIXED: Extract holders count from token data
+      const holdersCount = tokenData.holders || "0";
+      console.log(`✅ Extracted holders count: ${holdersCount}`);
+
       return {
         name: tokenData.name || tokenData.symbol || "Unknown",
         symbol: tokenData.symbol || "???",
         decimals: tokenData.decimals ? parseInt(tokenData.decimals) : 18,
         totalSupply: BigInt(finalSupply || 0),
+        holdersCount: parseInt(holdersCount) || 0,
         verified: tokenData.verified ? true : false,
         blockscoutData: tokenData
       };
@@ -219,6 +224,7 @@ async function fetchTokenInfoFromContract(tokenAddress) {
       symbol,
       decimals,
       totalSupply,
+      holdersCount: 0, // Can't get holders from contract call
       verified: false
     };
   } catch (err) {
@@ -228,6 +234,7 @@ async function fetchTokenInfoFromContract(tokenAddress) {
       symbol: "???",
       decimals: 18,
       totalSupply: 0n,
+      holdersCount: 0,
       verified: false
     };
   }
@@ -323,13 +330,83 @@ async function checkContractVerified(address) {
   }
 }
 
+// 🔥 FIXED: Get contract creation time for accurate age calculation
+async function getContractCreationTime(tokenAddress) {
+  try {
+    console.log(`🔍 Fetching contract creation time for ${tokenAddress}`);
+    
+    // Try V2 API first for contract creation
+    const response = await axios.get(`${BASE_URL}/smart-contracts/${tokenAddress.toLowerCase()}`, {
+      timeout: 5000
+    });
+    
+    if (response.data && response.status === 200 && response.data.created_at_block) {
+      const blockNumber = response.data.created_at_block.number;
+      const block = await provider.getBlock(blockNumber);
+      console.log(`✅ Found contract creation: block ${blockNumber}, timestamp ${block.timestamp}`);
+      return {
+        blockNumber,
+        timestamp: block.timestamp,
+        ageHours: Math.floor((Date.now() / 1000 - Number(block.timestamp)) / 3600)
+      };
+    }
+    
+    // Fallback: Try address transactions to find creation
+    const txResponse = await axios.get(`${BASE_URL}/addresses/${tokenAddress.toLowerCase()}/transactions`, {
+      params: { filter: 'creation', limit: 1 },
+      timeout: 5000
+    });
+    
+    if (txResponse.data && txResponse.data.items && txResponse.data.items.length > 0) {
+      const creationTx = txResponse.data.items[0];
+      const block = await provider.getBlock(creationTx.block_number);
+      console.log(`✅ Found creation via tx: block ${creationTx.block_number}, timestamp ${block.timestamp}`);
+      return {
+        blockNumber: creationTx.block_number,
+        timestamp: block.timestamp,
+        ageHours: Math.floor((Date.now() / 1000 - Number(block.timestamp)) / 3600)
+      };
+    }
+    
+    // Final fallback: Estimate from recent blocks
+    const latestBlock = await provider.getBlockNumber();
+    const estimatedBlock = Math.max(0, latestBlock - 10000);
+    const estimatedBlockData = await provider.getBlock(estimatedBlock);
+    const estimatedAgeHours = Math.floor((Date.now() / 1000 - Number(estimatedBlockData.timestamp)) / 3600);
+    
+    console.log(`⚠️ Estimated contract age: ~${estimatedAgeHours} hours`);
+    return {
+      blockNumber: estimatedBlock,
+      timestamp: estimatedBlockData.timestamp,
+      ageHours: estimatedAgeHours,
+      estimated: true
+    };
+    
+  } catch (err) {
+    console.log("Contract creation time fetch failed:", err.message);
+    
+    // Ultimate fallback: 24 hours estimate
+    const fallbackAge = 24;
+    console.log(`⚠️ Using fallback contract age: ${fallbackAge} hours`);
+    return {
+      blockNumber: null,
+      timestamp: Math.floor(Date.now() / 1000) - (fallbackAge * 3600),
+      ageHours: fallbackAge,
+      estimated: true
+    };
+  }
+}
+
 export async function analyzeToken(tokenAddress) {
   try {
     console.log(`🔍 Analyzing token: ${tokenAddress}`);
     
-    // --- 1. Get Enhanced Token Info with FIXED V2 Blockscout supply ---
+    // --- 1. Get Enhanced Token Info with FIXED V2 Blockscout supply & holders ---
     const tokenInfo = await fetchTokenInfoFromBlockscout(tokenAddress);
-    console.log(`Token info loaded: ${tokenInfo.name} (${tokenInfo.symbol}), Supply: ${tokenInfo.totalSupply.toString()}`);
+    console.log(`Token info loaded: ${tokenInfo.name} (${tokenInfo.symbol}), Supply: ${tokenInfo.totalSupply.toString()}, Holders: ${tokenInfo.holdersCount}`);
+    
+    // 🔥 FIXED: Get accurate contract creation time instead of pair time
+    const contractCreationInfo = await getContractCreationTime(tokenAddress);
     
     const contractAnalysis = await analyzeContractFeatures(tokenAddress);
     const verified = tokenInfo.verified || await checkContractVerified(tokenAddress);
@@ -386,7 +463,8 @@ export async function analyzeToken(tokenAddress) {
       security,
       contractAnalysis,
       riskAssessment,
-      pairCreationInfo
+      pairCreationInfo,
+      contractCreationInfo // 🔥 FIXED: Pass contract creation info for accurate age
     });
 
   } catch (err) {
@@ -625,7 +703,7 @@ async function analyzeHolderDistribution(tokenAddress, tokenInfo) {
   try {
     const allHolders = await getFixedTopHolders(tokenAddress, 100, tokenInfo.totalSupply, tokenInfo.decimals);
     
-    console.log(`Raw holders fetched: ${allHolders.length}`);
+    console.log(`Raw holders fetched: ${allHolders.length}, API reported: ${tokenInfo.holdersCount}`);
     
     // Filter out burn addresses and contract itself
     const liveHolders = allHolders.filter(h => 
@@ -639,9 +717,9 @@ async function analyzeHolderDistribution(tokenAddress, tokenInfo) {
     
     const top10Percent = liveHolders.slice(0, 10).reduce((sum, h) => sum + h.percent, 0);
     const giniCoefficient = calculateGiniCoefficient(liveHolders);
-    const holderCount = liveHolders.length;
+    const holderCount = Math.max(liveHolders.length, tokenInfo.holdersCount); // Use API count if higher
 
-    console.log(`Holder analysis: ${holderCount} live holders, top 10: ${top10Percent.toFixed(1)}%`);
+    console.log(`Holder analysis: ${holderCount} total holders, top 10: ${top10Percent.toFixed(1)}%`);
 
     return {
       top10Concentration: top10Percent,
@@ -655,7 +733,7 @@ async function analyzeHolderDistribution(tokenAddress, tokenInfo) {
     return {
       top10Concentration: 0,
       giniCoefficient: 0,
-      totalLiveHolders: 0,
+      totalLiveHolders: tokenInfo.holdersCount || 0, // Fallback to API count
       healthyDistribution: false,
       displayHolders: []
     };
@@ -1412,20 +1490,30 @@ function generateTraderInsights(analysis, riskPercentage) {
   return insights.length > 0 ? insights.join("\n") : "⚠️ No specific insights - CRITICAL: DYOR immediately";
 }
 
-// 🔥 FIXED: Enhanced report formatting with REAL V2 supply data
+// 🔥 FIXED: Enhanced report formatting with REAL V2 supply data & FIXED holders/age
 function formatAnalysisReport(analysis) {
   const { riskAssessment, tokenInfo, ownership, taxes, liquidity, holderAnalysis, 
-          simulation, activity, security, contractAnalysis, pairCreationInfo } = analysis;
+          simulation, activity, security, contractAnalysis, pairCreationInfo, contractCreationInfo } = analysis;
 
   const holdersText = holderAnalysis.displayHolders.length > 0 ? 
     holderAnalysis.displayHolders
       .map((h, i) => `${i + 1}. <code>${h.address.slice(0, 6)}...</code>: ${h.percent.toFixed(2)}%`)
       .join("\n") : "No holder data available";
 
+  // 🔥 FIXED: Use contract creation time for accurate age calculation
   let contractAge = "Unknown";
-  if (pairCreationInfo && pairCreationInfo.timestamp) {
-    const ageHours = liquidity.lpAgeHours || Math.floor((Date.now() / 1000 - Number(pairCreationInfo.timestamp)) / 3600);
-    contractAge = `${ageHours} hours`;
+  if (contractCreationInfo && contractCreationInfo.ageHours) {
+    const ageHours = contractCreationInfo.ageHours;
+    if (ageHours < 24) {
+      contractAge = `${ageHours}h`;
+    } else if (ageHours < 168) {
+      contractAge = `${Math.round(ageHours / 24)}d`;
+    } else if (ageHours < 720) {
+      contractAge = `${Math.round(ageHours / 168)}w`;
+    } else {
+      contractAge = `${Math.round(ageHours / 720)}m`;
+    }
+    contractAge += contractCreationInfo.estimated ? " (est.)" : "";
   }
 
   let lpDetails = liquidity.lpStatus;
@@ -1462,6 +1550,9 @@ function formatAnalysisReport(analysis) {
     }
   }
 
+  // 🔥 FIXED: Display holders count from API
+  const holdersDisplay = tokenInfo.holdersCount > 0 ? `${tokenInfo.holdersCount} holders` : "0 holders";
+
   return [
     `${riskAssessment.emoji} <b>${riskAssessment.level}</b> (${riskAssessment.riskPercentage}%)`,
     "",
@@ -1469,6 +1560,7 @@ function formatAnalysisReport(analysis) {
     `<code>${tokenInfo.name || 'Unknown'}</code> (<code>${tokenInfo.symbol || '???'}</code>)`,
     `Total Supply: <code>${formattedSupply}</code>`,
     `Contract Age: ${contractAge}`,
+    `${holdersDisplay}`,
     `Contract: ${contractAnalysis.isContract ? "✅ Deployed" : "❌ Not a contract"}`,
     `Verified: ${ownership.verified ? "✅ Verified Source Code" : "⚠️ Unverified"}`,
     "",
