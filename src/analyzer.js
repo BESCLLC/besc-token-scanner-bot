@@ -89,8 +89,8 @@ const LOCKER_ABI = [
 
 const routerAbi = require("./abi/Router.json");
 
-// Fixed API base URL - use correct v2 endpoint structure
-const BASE_URL = process.env.BLOCKSCOUT_API || "https://explorer.beschyperchain.com/api";
+// 🔥 FIXED: Correct V2 Blockscout API base URL
+const BASE_URL = process.env.BLOCKSCOUT_API || "https://explorer.beschyperchain.com/api/v2";
 
 // ✅ Only check LPs against your chain's base tokens
 const BASE_TOKENS = [
@@ -133,66 +133,63 @@ const ENHANCED_TOKEN_ABI = [
   "function burn(uint256) external"
 ];
 
-// 🔥 FIXED: Proper Blockscout token info fetcher with correct API parameters
+// 🔥 FIXED: V2 Blockscout API - Proper token info endpoint
 async function fetchTokenInfoFromBlockscout(tokenAddress) {
   try {
-    console.log(`🔍 Fetching token info from Blockscout: ${tokenAddress}`);
+    console.log(`🔍 Fetching token info from Blockscout V2: ${tokenAddress}`);
     
-    // ✅ FIXED: Use correct Blockscout API parameters (module and action)
-    const response = await axios.get(`${BASE_URL}`, {
-      params: {
-        module: "token",
-        action: "tokeninfo",
-        contractaddress: tokenAddress
-      },
+    // ✅ FIXED: Use V2 endpoint structure - /tokens/{address_hash}
+    const response = await axios.get(`${BASE_URL}/tokens/${tokenAddress.toLowerCase()}`, {
       timeout: 10000
     });
 
-    if (response.data.status === "1" && response.data.result) {
-      const tokenData = response.data.result;
+    console.log("Blockscout V2 response status:", response.status);
+    console.log("Blockscout V2 token data:", JSON.stringify(response.data, null, 2));
+
+    if (response.data && response.status === 200) {
+      const tokenData = response.data;
       
-      // ✅ Extract real total supply from Blockscout
-      let totalSupply = tokenData.total_supply || "0";
-      
-      // Handle different supply formats from Blockscout
-      if (typeof totalSupply === 'string') {
-        // Remove commas and try to parse
-        totalSupply = totalSupply.replace(/,/g, '');
-        if (!isNaN(totalSupply) && totalSupply !== "0") {
-          totalSupply = totalSupply;
-        } else {
-          totalSupply = "0";
-        }
+      // ✅ FIXED: Extract data from V2 response structure
+      let totalSupply = "0";
+      if (tokenData.total_supply) {
+        // V2 might return different formats - handle both string and number
+        totalSupply = tokenData.total_supply.toString().replace(/,/g, '');
       }
 
-      // Fallback: Try to get supply via contract call if Blockscout doesn't provide it
-      if (totalSupply === "0" || !totalSupply) {
+      console.log(`Blockscout V2 supply raw: ${tokenData.total_supply}, parsed: ${totalSupply}`);
+
+      // Validate supply - if it's invalid, fallback to contract
+      let finalSupply = totalSupply;
+      if (totalSupply === "0" || !totalSupply || isNaN(totalSupply) || BigInt(totalSupply) === 0n) {
+        console.log("Invalid Blockscout supply, trying contract call...");
         try {
           const tokenContract = new ethers.Contract(tokenAddress, ["function totalSupply() view returns (uint256)"], provider);
-          totalSupply = await tokenContract.totalSupply();
-          console.log(`✅ Fetched supply via contract call: ${totalSupply}`);
+          finalSupply = (await tokenContract.totalSupply()).toString();
+          console.log(`✅ Fetched supply via contract call: ${finalSupply}`);
         } catch (contractError) {
           console.log("Contract supply call failed:", contractError.message);
-          totalSupply = "0";
+          finalSupply = "0";
         }
       }
 
       return {
-        name: tokenData.name || "Unknown",
-        symbol: tokenData.symbol || "???", 
-        decimals: parseInt(tokenData.decimals) || 18,
-        totalSupply: BigInt(totalSupply || 0),
-        verified: true,
+        name: tokenData.name || tokenData.symbol || "Unknown",
+        symbol: tokenData.symbol || "???",
+        decimals: tokenData.decimals ? parseInt(tokenData.decimals) : 18,
+        totalSupply: BigInt(finalSupply || 0),
+        verified: tokenData.verified ? true : false,
         blockscoutData: tokenData
       };
     } else {
-      console.log("Blockscout token info failed, trying contract fallback");
-      // Fallback to contract calls
+      console.log("Blockscout V2 token info failed, trying contract fallback");
       return await fetchTokenInfoFromContract(tokenAddress);
     }
   } catch (err) {
-    console.log("Blockscout API error:", err.message);
-    console.log("Trying contract fallback...");
+    if (err.response && err.response.status === 404) {
+      console.log("Token not found on Blockscout V2, trying contract fallback...");
+    } else {
+      console.log("Blockscout V2 API error:", err.message);
+    }
     return await fetchTokenInfoFromContract(tokenAddress);
   }
 }
@@ -214,7 +211,8 @@ async function fetchTokenInfoFromContract(tokenAddress) {
       tokenContract.totalSupply().catch(() => 0n)
     ]);
 
-    console.log(`✅ Fetched from contract: ${name} (${symbol}), Supply: ${totalSupply}, Decimals: ${decimals}`);
+    const totalSupplyStr = totalSupply.toString();
+    console.log(`✅ Fetched from contract: ${name} (${symbol}), Supply: ${totalSupplyStr}, Decimals: ${decimals}`);
     
     return {
       name,
@@ -235,17 +233,138 @@ async function fetchTokenInfoFromContract(tokenAddress) {
   }
 }
 
+// 🔥 FIXED: V2 Blockscout API - Proper holders endpoint
+export async function getFixedTopHolders(tokenAddress, limit = 100, totalSupply, decimals) {
+  try {
+    console.log(`🔍 Getting top holders from Blockscout V2 for ${tokenAddress}, limit: ${limit}`);
+    
+    // ✅ FIXED: Ensure totalSupply is BigInt and fetch if needed
+    if (!totalSupply || typeof totalSupply === 'number' || totalSupply === '0') {
+      const tokenInfo = await fetchTokenInfoFromBlockscout(tokenAddress);
+      totalSupply = tokenInfo.totalSupply;
+      decimals = tokenInfo.decimals;
+      console.log(`Updated supply for holders: ${totalSupply.toString()}`);
+    }
+    
+    // ✅ FIXED: Use V2 endpoint - /tokens/{address_hash}/holders
+    const response = await axios.get(`${BASE_URL}/tokens/${tokenAddress.toLowerCase()}/holders`, {
+      params: {
+        filter: "all", // or "top" for top holders
+        items_count: limit
+      },
+      timeout: 10000
+    });
+
+    console.log("Blockscout V2 holders response status:", response.status);
+
+    if (response.data && Array.isArray(response.data) && response.status === 200) {
+      const holders = response.data.map((holder, index) => {
+        // ✅ FIXED: BigInt conversion for all numeric values from V2 API
+        const balance = BigInt(holder.value || holder.balance || 0);
+        const total = totalSupply || BigInt(0);
+        
+        // ✅ FIXED: Safe percentage calculation with BigInt
+        let percent = 0;
+        if (total > 0n) {
+          // Use 4 decimal precision for percentage
+          const percentage = (balance * 10000n) / total;
+          percent = Number(percentage) / 100;
+        }
+        
+        return {
+          address: holder.address || holder.token_holder_address || `0x${'0'.repeat(40)}`,
+          amount: balance,
+          percent: Math.min(Math.max(percent, 0), 100), // Clamp between 0-100%
+          rank: index + 1,
+          value: Number(ethers.formatUnits(balance, decimals || 18))
+        };
+      }).filter(h => h.amount > 0n); // Filter out zero balance holders
+
+      console.log(`✅ Fetched ${holders.length} holders from V2 API`);
+      return holders.slice(0, limit); // Ensure we don't exceed limit
+    }
+
+    console.log("No holders found in V2 response, trying fallback...");
+    
+    // Fallback: Try old V1 style if V2 fails
+    try {
+      const fallbackResponse = await axios.get(`${BASE_URL.replace('/v2', '')}?module=token&action=tokenholderlist&contractaddress=${tokenAddress}&page=1&offset=${limit}`, {
+        timeout: 5000
+      });
+      
+      if (fallbackResponse.data.status === "1" && fallbackResponse.data.result) {
+        console.log("✅ Fallback to V1 holders successful");
+        return fallbackResponse.data.result.map((holder, index) => {
+          const balance = BigInt(holder.balance || 0);
+          const total = totalSupply || BigInt(0);
+          
+          let percent = 0;
+          if (total > 0n) {
+            percent = Number((balance * 10000n) / total) / 100;
+          }
+          
+          return {
+            address: holder.TokenHolderAddress || `0x${'0'.repeat(40)}`,
+            amount: balance,
+            percent: Math.min(percent, 100),
+            rank: index + 1
+          };
+        });
+      }
+    } catch (fallbackErr) {
+      console.log("V1 fallback also failed:", fallbackErr.message);
+    }
+
+    console.log("No holders found, returning empty array");
+    return [];
+  } catch (err) {
+    console.error("❌ getFixedTopHolders failed:", err.message);
+    if (err.response) {
+      console.error("Response data:", err.response.data);
+    }
+    return [];
+  }
+}
+
+// 🔥 FIXED: V2 Blockscout API - Proper contract verification
+async function checkContractVerified(address) {
+  try {
+    // ✅ FIXED: Use V2 endpoint - /smart-contracts/{address_hash}
+    const response = await axios.get(`${BASE_URL}/smart-contracts/${address.toLowerCase()}`, {
+      timeout: 5000
+    });
+    
+    console.log("Contract verification V2 response:", response.status);
+    
+    return response.data && 
+           response.status === 200 && 
+           response.data.verified && 
+           response.data.verified === true;
+  } catch (err) {
+    if (err.response && err.response.status === 404) {
+      console.log(`Contract ${address} not verified on Blockscout V2`);
+    } else {
+      console.log(`Contract verification failed for ${address}:`, err.message);
+    }
+    return false;
+  }
+}
+
 export async function analyzeToken(tokenAddress) {
   try {
     console.log(`🔍 Analyzing token: ${tokenAddress}`);
     
-    // --- 1. Get Enhanced Token Info with FIXED Blockscout supply ---
-    const tokenInfo = await fetchTokenInfoFromBlockscout(tokenAddress); // 🔥 FIXED: Use our new proper fetcher
-    console.log(`Token info loaded: ${tokenInfo.name} (${tokenInfo.symbol}), Supply: ${tokenInfo.totalSupply}`);
+    // --- 1. Get Enhanced Token Info with FIXED V2 Blockscout supply ---
+    const tokenInfo = await fetchTokenInfoFromBlockscout(tokenAddress);
+    console.log(`Token info loaded: ${tokenInfo.name} (${tokenInfo.symbol}), Supply: ${tokenInfo.totalSupply.toString()}`);
     
     const contractAnalysis = await analyzeContractFeatures(tokenAddress);
     const verified = tokenInfo.verified || await checkContractVerified(tokenAddress);
+    
+    // 🔥 FIXED: Use our fixed holders function with V2 API
     const holderAnalysis = await analyzeHolderDistribution(tokenAddress, tokenInfo);
+    
+    // 🔥 FIXED: Better pair creation info
     const pairCreationInfo = await getPairCreationInfo(tokenAddress);
 
     // --- 2. Create token contract with enhanced ABI ---
@@ -256,7 +375,7 @@ export async function analyzeToken(tokenAddress) {
     ownership.verified = verified;
 
     // --- 4. Tax Analysis with Max Limits ---
-    const taxes = await analyzeTaxes(tokenContract, tokenInfo.totalSupply); // Pass supply for accurate %
+    const taxes = await analyzeTaxes(tokenContract, tokenInfo.totalSupply);
 
     // --- 5. Liquidity & LP Analysis with FIXED risk ---
     const liquidity = await analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo);
@@ -280,7 +399,7 @@ export async function analyzeToken(tokenAddress) {
       activity,
       security,
       contractAnalysis,
-      tokenInfo // Pass tokenInfo for better risk calculation
+      tokenInfo
     });
 
     return formatAnalysisReport({
@@ -303,7 +422,7 @@ export async function analyzeToken(tokenAddress) {
   }
 }
 
-// Get actual pair creation information
+// 🔥 FIXED: Pair creation info with proper event filtering
 async function getPairCreationInfo(tokenAddress) {
   try {
     if (!FACTORY_ADDRESS) return { blockNumber: null, timestamp: null };
@@ -317,33 +436,61 @@ async function getPairCreationInfo(tokenAddress) {
       provider
     );
 
-    const pair = await factory.getPair(tokenAddress, BASE_TOKENS[0] || ethers.ZeroAddress);
-    if (!pair || pair === ethers.ZeroAddress) return { blockNumber: null, timestamp: null };
-
-    // Get pair creation transaction
-    const filter = factory.filters.PairCreated(
-      null,
-      null,
-      pair
-    );
-    
-    const events = await factory.queryFilter(filter, -100000); // Last 100k blocks
-    if (events.length > 0) {
-      const event = events[0];
-      const block = await provider.getBlock(event.blockNumber);
-      return {
-        blockNumber: event.blockNumber,
-        timestamp: block.timestamp,
-        txHash: event.transactionHash
-      };
+    // Try to get pair first
+    let pair = ethers.ZeroAddress;
+    if (BASE_TOKENS.length > 0) {
+      for (const baseToken of BASE_TOKENS) {
+        try {
+          const foundPair = await factory.getPair(tokenAddress, baseToken);
+          if (foundPair && foundPair !== ethers.ZeroAddress) {
+            pair = foundPair;
+            console.log(`Found pair via factory: ${pair}`);
+            break;
+          }
+        } catch (pairError) {
+          console.log(`Pair lookup failed for base token ${baseToken}:`, pairError.message);
+        }
+      }
     }
 
-    // Fallback: get pair contract creation
-    const pairCode = await provider.getCode(pair);
-    if (pairCode !== "0x") {
+    if (pair === ethers.ZeroAddress) return { blockNumber: null, timestamp: null };
+
+    // 🔥 FIXED: Proper event filtering - only filter indexed parameters
+    try {
+      const filter = factory.filters.PairCreated(null, null, pair);
+      const events = await factory.queryFilter(filter, -50000, "latest");
+      
+      if (events.length > 0) {
+        const event = events[0];
+        const block = await provider.getBlock(event.blockNumber);
+        console.log(`✅ Found pair creation: block ${event.blockNumber}, timestamp ${block.timestamp}`);
+        return {
+          blockNumber: event.blockNumber,
+          timestamp: block.timestamp,
+          txHash: event.transactionHash,
+          pairAddress: pair
+        };
+      }
+    } catch (filterError) {
+      console.log("Event filter failed, trying alternative method:", filterError.message);
+    }
+
+    // Fallback: Estimate from pair deployment
+    try {
       const latestBlock = await provider.getBlockNumber();
-      const creationBlock = Math.max(0, latestBlock - 50000); // Estimate
-      return { blockNumber: creationBlock, timestamp: Math.floor(Date.now() / 1000) };
+      const creationBlock = Math.max(0, latestBlock - 50000);
+      const latestBlockData = await provider.getBlock(latestBlock);
+      const estimatedTimestamp = latestBlockData.timestamp - (50000 * 12); // 12s blocks
+      
+      console.log(`Estimated pair creation: block ${creationBlock}, timestamp ${estimatedTimestamp}`);
+      return { 
+        blockNumber: creationBlock, 
+        timestamp: estimatedTimestamp,
+        estimated: true,
+        pairAddress: pair
+      };
+    } catch (estimateError) {
+      console.log("Estimation failed:", estimateError.message);
     }
 
   } catch (err) {
@@ -361,7 +508,6 @@ async function analyzeContractFeatures(tokenAddress) {
       return { isContract: false, warning: "Address is not a contract" };
     }
 
-    // Check for common dangerous patterns
     const codeLower = code.toLowerCase();
     const suspiciousPatterns = {
       canMint: codeLower.includes("function mint(") || codeLower.includes("_mint("),
@@ -375,9 +521,10 @@ async function analyzeContractFeatures(tokenAddress) {
       isContract: true,
       bytecodeSize: code.length,
       suspiciousPatterns,
-      complexityScore: Math.min((code.length / 1000), 10) // Normalize to 0-10
+      complexityScore: Math.min((code.length / 1000), 10)
     };
-  } catch {
+  } catch (err) {
+    console.log("Contract feature analysis failed:", err.message);
     return { isContract: false, warning: "Could not fetch contract code" };
   }
 }
@@ -390,13 +537,14 @@ async function analyzeOwnership(tokenContract, tokenAddress) {
   let ownershipRisk = "Low";
 
   try {
-    // Try multiple owner functions
     const ownerMethods = ["getOwner", "owner", "admin"];
     for (const method of ownerMethods) {
       try {
         owner = await tokenContract[method]();
         if (owner && owner !== ethers.ZeroAddress) break;
-      } catch {}
+      } catch (methodErr) {
+        // Continue to next method
+      }
     }
 
     // Check renounce function existence
@@ -405,14 +553,12 @@ async function analyzeOwnership(tokenContract, tokenAddress) {
       canRenounce = true;
     } catch {}
 
-    // Check if already renounced (owner is 0x0)
     if (owner === ethers.ZeroAddress) {
       ownershipRisk = "None (Renounced)";
       renounceable = true;
     } else if (owner && owner.toLowerCase() === tokenAddress.toLowerCase()) {
       ownershipRisk = "Medium (Self-owned)";
     } else {
-      // Check if owner can transfer ownership
       try {
         await tokenContract.transferOwnership.estimateGas(ethers.Wallet.createRandom().address);
         ownershipRisk = "High (Transferable)";
@@ -426,14 +572,14 @@ async function analyzeOwnership(tokenContract, tokenAddress) {
   }
 
   return { 
-    owner, 
+    owner: owner === ethers.ZeroAddress ? "RENOUNCED" : (owner || "Unknown"), 
     canRenounce, 
     renounceable, 
     ownershipRisk
   };
 }
 
-// 🔥 FIXED: Enhanced tax analysis with proper supply handling
+// 🔥 FIXED: Enhanced tax analysis with proper BigInt supply handling
 async function analyzeTaxes(tokenContract, totalSupply) {
   const taxFunctions = {
     buy: ["liquidityFee", "marketingFee", "rewardsFee", "teamFee", "tax", "buyTax"],
@@ -449,7 +595,7 @@ async function analyzeTaxes(tokenContract, totalSupply) {
     try {
       const result = await tokenContract[fn]();
       if (result && !isNaN(Number(result))) {
-        buyTax += Number(result);
+        buyTax += Number(ethers.formatUnits(result, 0)); // Handle potential scaled values
       }
     } catch {}
   }
@@ -459,31 +605,33 @@ async function analyzeTaxes(tokenContract, totalSupply) {
     try {
       const result = await tokenContract[fn]();
       if (result && !isNaN(Number(result))) {
-        sellTax += Number(result);
+        sellTax += Number(ethers.formatUnits(result, 0));
       }
     } catch {}
   }
 
-  // 🔥 FIXED: Check max transaction limits with proper supply
+  // 🔥 FIXED: Check max transaction limits with proper BigInt supply
   if (totalSupply && totalSupply > 0n) {
     for (const fn of taxFunctions.maxTx) {
       try {
         const maxTx = await tokenContract[fn]();
         if (maxTx && maxTx > 0n && maxTx < totalSupply) {
-          maxTxPercent = Number((maxTx * 100n) / totalSupply);
+          const percent = Number((maxTx * 10000n) / totalSupply) / 100;
+          maxTxPercent = Math.min(Math.max(percent, 0), 100);
           break;
         }
       } catch {}
     }
   }
 
-  // 🔥 FIXED: Check max wallet limits with proper supply
+  // 🔥 FIXED: Check max wallet limits with proper BigInt supply
   if (totalSupply && totalSupply > 0n) {
     for (const fn of taxFunctions.maxWallet) {
       try {
         const maxWallet = await tokenContract[fn]();
         if (maxWallet && maxWallet > 0n && maxWallet < totalSupply) {
-          maxWalletPercent = Number((maxWallet * 100n) / totalSupply);
+          const percent = Number((maxWallet * 10000n) / totalSupply) / 100;
+          maxWalletPercent = Math.min(Math.max(percent, 0), 100);
           break;
         }
       } catch {}
@@ -491,15 +639,75 @@ async function analyzeTaxes(tokenContract, totalSupply) {
   }
 
   return {
-    buyTax: Math.min(buyTax, 100), // Cap at 100%
-    sellTax: Math.min(sellTax, 100),
+    buyTax: Math.min(Math.max(buyTax, 0), 100),
+    sellTax: Math.min(Math.max(sellTax, 0), 100),
     maxTxPercent,
     maxWalletPercent,
-    hasHighLimits: maxTxPercent >= 1 && maxWalletPercent >= 2 // Reasonable minimums
+    hasHighLimits: maxTxPercent >= 1 && maxWalletPercent >= 2
   };
 }
 
-// FIXED: Enhanced liquidity analysis with REAL locker checking and proper risk
+// 🔥 FIXED: Enhanced holder distribution with BigInt safety and V2 API
+async function analyzeHolderDistribution(tokenAddress, tokenInfo) {
+  try {
+    const allHolders = await getFixedTopHolders(tokenAddress, 100, tokenInfo.totalSupply, tokenInfo.decimals);
+    
+    // Filter out burn addresses and contract itself
+    const liveHolders = allHolders.filter(h => 
+      !h.address.toLowerCase().includes("dead") &&
+      h.address.toLowerCase() !== "0x0000000000000000000000000000000000000000" &&
+      h.address.toLowerCase() !== tokenAddress.toLowerCase() &&
+      h.amount > 0n
+    );
+
+    const top10Percent = liveHolders.slice(0, 10).reduce((sum, h) => sum + h.percent, 0);
+    const giniCoefficient = calculateGiniCoefficient(liveHolders);
+    const holderCount = liveHolders.length;
+
+    console.log(`Holder analysis: ${holderCount} live holders, top 10: ${top10Percent.toFixed(1)}%`);
+
+    return {
+      top10Concentration: top10Percent,
+      giniCoefficient: Math.round(giniCoefficient * 100) / 100,
+      totalLiveHolders: holderCount,
+      healthyDistribution: top10Percent < 40 && holderCount > 10 && giniCoefficient < 0.7,
+      displayHolders: liveHolders.slice(0, 8)
+    };
+  } catch (err) {
+    console.error("❌ Holder analysis failed:", err.message);
+    return {
+      top10Concentration: 0,
+      giniCoefficient: 0,
+      totalLiveHolders: 0,
+      healthyDistribution: false,
+      displayHolders: []
+    };
+  }
+}
+
+function calculateGiniCoefficient(holders) {
+  if (holders.length === 0) return 0;
+  
+  // Use percentages for Gini calculation (already normalized)
+  const totalPercent = holders.reduce((sum, h) => sum + h.percent, 0);
+  if (totalPercent === 0) return 0;
+  
+  let accumulator = 0;
+  let cumulativeShare = 0;
+  
+  const sortedHolders = [...holders].sort((a, b) => b.percent - a.percent);
+  
+  for (let i = 0; i < sortedHolders.length; i++) {
+    const holder = sortedHolders[i];
+    const share = holder.percent / 100;
+    cumulativeShare += share;
+    accumulator += (cumulativeShare - (i + 1) / sortedHolders.length) * share;
+  }
+  
+  return Math.abs(accumulator);
+}
+
+// 🔥 FIXED: Liquidity analysis with better error handling
 async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo) {
   let lpStatus = "⚠️ No LP found";
   let lpPercentBurned = 0;
@@ -512,36 +720,30 @@ async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo) {
   let lockedPercent = 0;
   let unlockTime = 0;
   let unlockDate = "N/A";
-  let lpRiskLevel = "HIGH"; // Default to high risk
+  let lpRiskLevel = "HIGH";
 
   try {
     lpPair = await findLiquidityPair(tokenAddress);
 
     if (lpPair && lpPair !== ethers.ZeroAddress) {
+      console.log(`Found LP pair: ${lpPair}`);
+      
       const lpContract = new ethers.Contract(lpPair, lpAbi, provider);
       
-      // Get LP supply and burn status
       const lpSupply = await lpContract.totalSupply();
       const deadBalance = await lpContract.balanceOf("0x000000000000000000000000000000000000dEaD");
       lpPercentBurned = lpSupply > 0n ? Number((deadBalance * 10000n) / lpSupply) / 100 : 0;
 
-      // Determine paired token
+      console.log(`LP Supply: ${ethers.formatEther(lpSupply)}, Burned: ${lpPercentBurned.toFixed(1)}%`);
+
       const token0 = await lpContract.token0();
       const token1 = await lpContract.token1();
       pairedToken = token0.toLowerCase() === tokenAddress.toLowerCase() ? token1 : token0;
 
-      // Calculate actual LP age from pair creation
+      // Calculate LP age
       if (pairCreationInfo && pairCreationInfo.timestamp) {
         const now = Math.floor(Date.now() / 1000);
         lpAgeDays = Math.floor((now - Number(pairCreationInfo.timestamp)) / 86400);
-      } else {
-        // Fallback calculation based on block number
-        const latestBlock = await provider.getBlockNumber();
-        if (pairCreationInfo && pairCreationInfo.blockNumber) {
-          const blocksSinceCreation = latestBlock - pairCreationInfo.blockNumber;
-          // Assume 12 seconds per block (adjust for your chain)
-          lpAgeDays = Math.floor((blocksSinceCreation * 12) / 86400);
-        }
       }
 
       // === REAL LOCKER CHECKING ===
@@ -606,7 +808,7 @@ async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo) {
     lockedPercent,
     unlockTime,
     unlockDate,
-    lpRiskLevel // NEW: Explicit risk level for LP
+    lpRiskLevel
   };
 }
 
@@ -621,7 +823,6 @@ async function checkLockerStatus(lpPair, totalLPSupply) {
     
     const lockerContract = new ethers.Contract(LOCKER_ADDRESS, LOCKER_ABI, provider);
     
-    // Get all locks for the LP pair address (as the "user" of the locker)
     const userLocks = await lockerContract.getUserLocks(lpPair);
     
     console.log(`Found ${userLocks.length} locks for LP ${lpPair}`);
@@ -630,29 +831,20 @@ async function checkLockerStatus(lpPair, totalLPSupply) {
     let earliestUnlockTime = 0;
     let hasActiveLocks = false;
 
-    // Analyze each lock
     for (const lock of userLocks) {
-      console.log(`Lock analysis: amount=${lock.amount}, unlocked=${lock.unlocked}, unlockTime=${lock.unlockTime}, token=${lock.token}`);
-      
-      // Only consider active (not unlocked) locks for this specific LP token
       if (!lock.unlocked && lock.token.toLowerCase() === lpPair.toLowerCase()) {
         hasActiveLocks = true;
         totalLockedAmount += lock.amount;
         
-        // Track the earliest unlock time among active locks
         if (earliestUnlockTime === 0 || lock.unlockTime < earliestUnlockTime) {
           earliestUnlockTime = Number(lock.unlockTime);
         }
-        
-        console.log(`Active lock found: ${ethers.formatEther(lock.amount)} LP tokens until ${new Date(lock.unlockTime * 1000).toLocaleDateString()}`);
       }
     }
 
     if (hasActiveLocks && totalLPSupply > 0n) {
       const lockedPercent = Number((totalLockedAmount * 10000n) / totalLPSupply) / 100;
       const unlockDate = new Date(earliestUnlockTime * 1000).toLocaleDateString();
-      
-      console.log(`Total locked: ${ethers.formatEther(totalLockedAmount)} LP tokens (${lockedPercent.toFixed(1)}%) until ${unlockDate}`);
       
       return {
         locked: true,
@@ -664,7 +856,6 @@ async function checkLockerStatus(lpPair, totalLPSupply) {
       };
     }
 
-    console.log("No active LP locks found");
     return { 
       locked: false, 
       lockedAmount: 0n, 
@@ -714,11 +905,15 @@ async function findLiquidityPair(tokenAddress) {
       );
       
       for (const baseToken of BASE_TOKENS) {
-        const pair = await factory.getPair(tokenAddress, baseToken);
-        if (pair && pair !== ethers.ZeroAddress) {
-          lpPair = pair;
-          console.log(`Found LP pair via factory: ${lpPair} with base token ${baseToken}`);
-          break;
+        try {
+          const pair = await factory.getPair(tokenAddress, baseToken);
+          if (pair && pair !== ethers.ZeroAddress) {
+            lpPair = pair;
+            console.log(`Found LP pair via factory: ${lpPair} with base token ${baseToken}`);
+            return lpPair;
+          }
+        } catch (pairErr) {
+          console.log(`Factory pair lookup failed for ${baseToken}:`, pairErr.message);
         }
       }
     } catch (err) {
@@ -726,37 +921,29 @@ async function findLiquidityPair(tokenAddress) {
     }
   }
 
-  // Strategy 3: Direct LP search via explorer API
-  if (lpPair === ethers.ZeroAddress) {
-    try {
-      lpPair = await findPairViaExplorer(tokenAddress);
-    } catch (err) {
-      console.log("Explorer pair search failed:", err.message);
-    }
-  }
-
-  return lpPair;
-}
-
-async function findPairViaExplorer(tokenAddress) {
+  // Strategy 3: Try V2 API for token transfers to find LP
   try {
-    // Use Blockscout API to find transactions involving the token that might be pair creation
-    const response = await axios.get(`${BASE_URL}`, {
-      params: {
-        module: "account",
-        action: "txlist",
-        address: tokenAddress,
-        limit: 10
-      },
+    const transfersResponse = await axios.get(`${BASE_URL}/tokens/${tokenAddress.toLowerCase()}/transfers`, {
+      params: { limit: 10 },
       timeout: 5000
     });
     
-    // This is a simplified approach - in production you'd parse transaction data for pair creation
-    return ethers.ZeroAddress;
-  } catch (err) {
-    console.log("Explorer pair search failed:", err.message);
-    return ethers.ZeroAddress;
+    if (transfersResponse.data && Array.isArray(transfersResponse.data)) {
+      // Look for transfers involving common LP patterns
+      for (const transfer of transfersResponse.data) {
+        if (transfer.from_hash && transfer.to_hash && 
+            transfer.from_hash !== tokenAddress.toLowerCase() && 
+            transfer.to_hash !== tokenAddress.toLowerCase()) {
+          // This might be an LP address - would need more sophisticated logic
+          console.log("Found potential LP via transfers:", transfer.to_hash);
+        }
+      }
+    }
+  } catch (apiErr) {
+    console.log("V2 transfers API failed:", apiErr.message);
   }
+
+  return lpPair;
 }
 
 // FIXED: Honeypot simulation - Simplified to avoid false positives
@@ -771,13 +958,12 @@ async function simulateTrading(tokenAddress, tokenInfo, liquidity) {
     const tokenDecimals = tokenInfo.decimals || 18;
     const testAmount = ethers.parseUnits("1", tokenDecimals);
 
-    // 1. Direct transfer simulation - FIXED to be more lenient
+    // 1. Direct transfer simulation
     try {
       const tokenContract = new ethers.Contract(tokenAddress, [
         "function transfer(address to, uint256 amount) external returns (bool)"
       ], provider);
       
-      // Try with zero amount first (most contracts allow this)
       await provider.call({
         to: tokenAddress,
         data: tokenContract.interface.encodeFunctionData("transfer", [
@@ -788,7 +974,6 @@ async function simulateTrading(tokenAddress, tokenInfo, liquidity) {
       simulations.transfer = "✅ Transfer simulation passed";
     } catch (transferError) {
       try {
-        // Try with small amount
         const tokenContract = new ethers.Contract(tokenAddress, [
           "function transfer(address to, uint256 amount) external returns (bool)"
         ], provider);
@@ -802,7 +987,6 @@ async function simulateTrading(tokenAddress, tokenInfo, liquidity) {
         simulations.transfer = "✅ Transfer simulation passed";
       } catch (transferError2) {
         const transferReason = transferError2.reason || transferError2.message || "";
-        // Expanded list of acceptable failures
         if (transferReason.toLowerCase().includes("insufficient balance") || 
             transferReason.toLowerCase().includes("transfer amount exceeds") ||
             transferReason.toLowerCase().includes("revert") ||
@@ -814,7 +998,7 @@ async function simulateTrading(tokenAddress, tokenInfo, liquidity) {
       }
     }
 
-    // 2. Buy/Sell simulation - FIXED to use approval test
+    // 2. Buy/Sell simulation - approval test
     if (liquidity.lpPair && liquidity.pairedToken && ROUTER_ADDRESS) {
       try {
         const tokenContract = new ethers.Contract(tokenAddress, [
@@ -832,7 +1016,6 @@ async function simulateTrading(tokenAddress, tokenInfo, liquidity) {
         simulations.sell = "✅ Sell simulation passed (approval test)";
       } catch (approvalError) {
         const approvalReason = approvalError.reason || approvalError.message || "";
-        // Expanded list of acceptable failures
         if (approvalReason.toLowerCase().includes("insufficient allowance") ||
             approvalReason.toLowerCase().includes("revert") ||
             approvalReason.toLowerCase().includes("require") ||
@@ -881,15 +1064,12 @@ function extractErrorReason(message) {
   return message.length > 50 ? `${message.substring(0, 50)}...` : message;
 }
 
-// FIXED: Honeypot risk assessment - More lenient to avoid false positives
 function assessHoneypotRisk(simulations) {
-  // Count only CRITICAL failures (not expected or inconclusive ones)
   const criticalFailures = Object.values(simulations).filter(s => 
     s.includes("❌") || 
     (s.includes("failed") && !s.includes("expected") && !s.includes("inconclusive"))
   );
   
-  // Count warnings that might indicate issues
   const warnings = Object.values(simulations).filter(s => 
     s.includes("⚠️") && !s.includes("missing") && !s.includes("data")
   );
@@ -905,7 +1085,6 @@ function assessHoneypotRisk(simulations) {
     return "🟡 MODERATE CONCERNS - Multiple simulation warnings";
   }
 
-  // If most simulations pass or have expected failures, it's safe
   const passingOrExpected = Object.values(simulations).filter(s => 
     s.includes("✅") || 
     s.includes("ℹ️") || 
@@ -922,7 +1101,7 @@ function assessHoneypotRisk(simulations) {
   return "🟡 UNCLEAR - Insufficient simulation data";
 }
 
-// FIXED: Trading activity analysis with proper decimal handling
+// FIXED: Trading activity analysis
 async function analyzeTradingActivity(tokenContract, owner, tokenDecimals) {
   let devActivity = "✅ No suspicious dev activity";
   let volume24h = "0";
@@ -931,15 +1110,13 @@ async function analyzeTradingActivity(tokenContract, owner, tokenDecimals) {
   let totalTransactions24h = 0;
 
   try {
-    // Dev wallet monitoring (if owner exists)
-    if (owner && owner !== "N/A" && owner !== ethers.ZeroAddress) {
+    if (owner && owner !== "N/A" && owner !== ethers.ZeroAddress && owner !== "RENOUNCED") {
       const devActivityReport = await monitorDevWallet(tokenContract, owner);
       if (devActivityReport.suspicious) {
         devActivity = `🚨 DEV ACTIVITY: ${devActivityReport.details}`;
       }
     }
 
-    // Get real trading metrics using event logs
     const tradingMetrics = await getRealTradingMetrics(tokenContract, tokenDecimals);
     if (tradingMetrics) {
       volume24h = tradingMetrics.volume24h;
@@ -964,28 +1141,28 @@ async function analyzeTradingActivity(tokenContract, owner, tokenDecimals) {
 
 async function monitorDevWallet(tokenContract, owner) {
   try {
-    const filter = tokenContract.filters.Transfer(owner, null); // Dev sells
-    const buyFilter = tokenContract.filters.Transfer(null, owner); // Dev buys
+    const filter = tokenContract.filters.Transfer(owner, null);
+    const buyFilter = tokenContract.filters.Transfer(null, owner);
     
     const latestBlock = await provider.getBlockNumber();
-    const fromBlock = Math.max(0, latestBlock - 10000); // Last ~2-3 days
+    const fromBlock = Math.max(0, latestBlock - 10000);
     
     const [sells, buys] = await Promise.all([
-      tokenContract.queryFilter(filter, fromBlock, latestBlock),
-      tokenContract.queryFilter(buyFilter, fromBlock, latestBlock)
+      tokenContract.queryFilter(filter, fromBlock, latestBlock).catch(() => []),
+      tokenContract.queryFilter(buyFilter, fromBlock, latestBlock).catch(() => [])
     ]);
 
-    const sellValue = sells.reduce((sum, log) => sum + Number(log.args.value), 0n);
-    const buyValue = buys.reduce((sum, log) => sum + Number(log.args.value), 0n);
+    const sellValue = sells.reduce((sum, log) => sum + Number(log.args?.value || 0), 0n);
+    const buyValue = buys.reduce((sum, log) => sum + Number(log.args?.value || 0), 0n);
     
-    if (sells.length > 0 && sellValue > buyValue * 2n) { // Selling > 2x buying
+    if (sells.length > 0 && sellValue > buyValue * 2n) {
       return {
         suspicious: true,
         details: `${sells.length} sells (${ethers.formatEther(sellValue)} tokens) vs ${buys.length} buys (${ethers.formatEther(buyValue)})`
       };
     }
 
-    if (sells.length > 5) { // Too many sells
+    if (sells.length > 5) {
       return {
         suspicious: true,
         details: `${sells.length} sells in last 48h - high frequency trading`
@@ -999,28 +1176,26 @@ async function monitorDevWallet(tokenContract, owner) {
   return { suspicious: false, details: "Normal activity" };
 }
 
-// FIXED: Real trading metrics with proper decimal handling
 async function getRealTradingMetrics(tokenContract, tokenDecimals) {
   try {
     const filter = tokenContract.filters.Transfer();
     const latestBlock = await provider.getBlockNumber();
-    const fromBlock = Math.max(0, latestBlock - 5000); // Last ~24h
+    const fromBlock = Math.max(0, latestBlock - 5000);
     
-    const transfers = await tokenContract.queryFilter(filter, fromBlock, latestBlock);
+    const transfers = await tokenContract.queryFilter(filter, fromBlock, latestBlock).catch(() => []);
     
     if (!transfers || transfers.length === 0) return null;
 
-    // Use provided decimals or fetch if not provided
     let decimals = tokenDecimals || 18;
-    if (!tokenDecimals) {
+    if (!tokenDecimals || typeof tokenDecimals !== 'number') {
       try {
         decimals = await tokenContract.decimals();
       } catch {
         console.log("Could not fetch token decimals, using 18");
+        decimals = 18;
       }
     }
 
-    // Analyze transfer patterns to identify buys/sells
     const uniqueFrom = new Set();
     const uniqueTo = new Set();
     let totalValue = 0n;
@@ -1028,21 +1203,19 @@ async function getRealTradingMetrics(tokenContract, tokenDecimals) {
     for (const transfer of transfers) {
       if (transfer.args && transfer.args.value) {
         totalValue += transfer.args.value;
-        uniqueFrom.add(transfer.args.from);
-        uniqueTo.add(transfer.args.to);
+        if (transfer.args.from) uniqueFrom.add(transfer.args.from);
+        if (transfer.args.to) uniqueTo.add(transfer.args.to);
       }
     }
     
-    // FIXED: Properly format volume using token decimals
     const formattedVolume = ethers.formatUnits(totalValue, decimals);
     
-    // Estimate buys as transfers TO unique addresses (simplified)
     const estimatedBuys = Math.floor(transfers.length * 0.6);
     const estimatedSells = transfers.length - estimatedBuys;
     
     return {
-      volume24h: Number(formattedVolume).toFixed(2), // Round to 2 decimals
-      uniqueBuyers: uniqueFrom.size,
+      volume24h: Number(formattedVolume).toLocaleString(),
+      uniqueBuyers: uniqueTo.size,
       buySellRatio: `${estimatedBuys}:${estimatedSells}`,
       totalTransactions: transfers.length
     };
@@ -1064,23 +1237,19 @@ async function analyzeSecurityFeatures(tokenAddress) {
   try {
     const tokenContract = new ethers.Contract(tokenAddress, ENHANCED_TOKEN_ABI, provider);
 
-    // Blacklist check
     try {
       const isBlacklisted = await tokenContract._isBlacklisted(ethers.Wallet.createRandom().address);
       features.blacklistCheck = !!isBlacklisted;
     } catch {}
 
-    // Minting capability
     try {
       await tokenContract.mint.estimateGas(ethers.Wallet.createRandom().address, 1n);
       features.mintable = true;
     } catch {}
 
-    // Pause functionality (common patterns)
     const code = await provider.getCode(tokenAddress);
     features.pauseable = code.toLowerCase().includes("paus") || code.toLowerCase().includes("freeze");
 
-    // Check if renounceOwnership exists and can be called
     try {
       await tokenContract.renounceOwnership.estimateGas();
       features.ownershipRenounceable = true;
@@ -1100,7 +1269,7 @@ async function analyzeSecurityFeatures(tokenAddress) {
 }
 
 function calculateSecurityScore(features) {
-  let score = 10; // Start with max score
+  let score = 10;
   
   if (features.mintable) score -= 4;
   if (features.blacklistCheck) score -= 3;
@@ -1110,104 +1279,20 @@ function calculateSecurityScore(features) {
   return Math.max(0, score);
 }
 
-// Enhanced holder distribution analysis
-async function analyzeHolderDistribution(tokenAddress, tokenInfo) {
-  try {
-    const allHolders = await getTopHolders(tokenAddress, 100, tokenInfo.totalSupply, tokenInfo.decimals);
-    
-    // Filter out burn addresses and contract itself
-    const liveHolders = allHolders.filter(h => 
-      !h.address.toLowerCase().includes("dead") &&
-      h.address.toLowerCase() !== "0x0000000000000000000000000000000000000000" &&
-      h.address.toLowerCase() !== tokenAddress.toLowerCase()
-    );
-
-    const top10Percent = liveHolders.slice(0, 10).reduce((sum, h) => sum + h.percent, 0);
-    const giniCoefficient = calculateGiniCoefficient(liveHolders);
-    const holderCount = liveHolders.length;
-
-    return {
-      top10Concentration: top10Percent,
-      giniCoefficient: Math.round(giniCoefficient * 100) / 100,
-      totalLiveHolders: holderCount,
-      healthyDistribution: top10Percent < 40 && holderCount > 50 && giniCoefficient < 0.7,
-      displayHolders: liveHolders.slice(0, 8)
-    };
-  } catch (err) {
-    console.log("Holder analysis failed:", err.message);
-    return {
-      top10Concentration: 0,
-      giniCoefficient: 0,
-      totalLiveHolders: 0,
-      healthyDistribution: false,
-      displayHolders: []
-    };
-  }
-}
-
-function calculateGiniCoefficient(holders) {
-  if (holders.length === 0) return 0;
-  
-  const totalSupply = holders.reduce((sum, h) => sum + (h.amount || 0), 0);
-  if (totalSupply === 0) return 0;
-  
-  let accumulator = 0;
-  let cumulativeShare = 0;
-  
-  // Sort holders by amount (descending)
-  const sortedHolders = [...holders].sort((a, b) => (b.amount || 0) - (a.amount || 0));
-  
-  for (let i = 0; i < sortedHolders.length; i++) {
-    const holder = sortedHolders[i];
-    const share = (holder.amount || 0) / totalSupply;
-    cumulativeShare += share;
-    // Gini calculation using Lorenz curve approximation
-    accumulator += (cumulativeShare - (i + 1) / sortedHolders.length) * share;
-  }
-  
-  return Math.abs(accumulator);
-}
-
-// Fixed contract verification using correct API endpoint
-async function checkContractVerified(address) {
-  try {
-    const response = await axios.get(`${BASE_URL}`, {
-      params: {
-        module: "contract",
-        action: "getsourcecode",
-        address: address
-      },
-      timeout: 5000
-    });
-    
-    return response.data && 
-           response.data.status === "1" && 
-           response.data.result &&
-           response.data.result[0] &&
-           response.data.result[0].SourceCode !== "" &&
-           response.data.result[0].ABI !== "Contract source code not verified";
-  } catch (err) {
-    console.log(`Contract verification failed for ${address}:`, err.message);
-    return false;
-  }
-}
-
-// FIXED: Comprehensive risk calculation with PROPER LP weighting
+// 🔥 FIXED: Comprehensive risk calculation
 function calculateComprehensiveRisk(analysis) {
   let score = 0;
   const factors = [];
 
-  // Ownership risk (15 points max)
   if (analysis.ownership.ownershipRisk === "High") score += 12;
   else if (analysis.ownership.ownershipRisk === "Medium") score += 6;
 
-  // Tax risk (20 points max)
   if (analysis.taxes.buyTax > 15 || analysis.taxes.sellTax > 15) score += 16;
   else if (analysis.taxes.buyTax > 10 || analysis.taxes.sellTax > 10) score += 10;
   
   if (!analysis.taxes.hasHighLimits) score += 6;
 
-  // FIXED: Liquidity risk (30 points max) - MUCH MORE WEIGHT GIVEN
+  // Liquidity risk (30 points max)
   if (!analysis.liquidity.hasLiquidity) {
     score += 30;
     factors.push("🚨 NO LIQUIDITY - CRITICAL RISK");
@@ -1220,12 +1305,11 @@ function calculateComprehensiveRisk(analysis) {
   } else if (analysis.liquidity.lpRiskLevel === "MEDIUM") {
     score += 12;
     factors.push("🟡 PARTIAL LP PROTECTION - MODERATE RUG RISK");
-  } else if (analysis.liquidity.lpRiskLevel === "LOW") {
+  } else {
     score += 0;
     factors.push("✅ STRONG LP PROTECTION - LOW RUG RISK");
   }
 
-  // Holder concentration risk (15 points max)
   if (analysis.holderAnalysis.top10Concentration > 60) {
     score += 15;
     factors.push("🐋 EXTREME WHALE CONCENTRATION");
@@ -1234,7 +1318,6 @@ function calculateComprehensiveRisk(analysis) {
     factors.push("🐋 HIGH WHALE CONCENTRATION");
   }
 
-  // Honeypot risk (10 points max)
   if (analysis.simulation.honeypotRisk.includes("HIGH")) {
     score += 10;
     factors.push("🛑 HIGH HONEYPOT RISK");
@@ -1243,14 +1326,12 @@ function calculateComprehensiveRisk(analysis) {
     factors.push("⚠️ POTENTIAL HONEYPOT CONCERNS");
   }
 
-  // Security features risk (10 points max)
   if (analysis.security.hasDangerousFeatures) {
     score += 8;
     factors.push("🚨 DANGEROUS CONTRACT FEATURES");
   }
   if (analysis.security.securityScore < 5) score += 2;
 
-  // Activity risk (5 points max)
   if (!analysis.activity.hasHealthyActivity) {
     score += 3;
     factors.push("📉 LOW TRADING ACTIVITY");
@@ -1260,14 +1341,12 @@ function calculateComprehensiveRisk(analysis) {
     factors.push("🚨 SUSPICIOUS DEV ACTIVITY");
   }
 
-  // Contract complexity (5 points max)
   if (analysis.contractAnalysis.complexityScore > 7) score += 3;
   if (analysis.contractAnalysis.suspiciousPatterns.canMint) score += 2;
 
   const maxScore = 110;
   const riskPercentage = Math.round((score / maxScore) * 100);
   
-  // FIXED: Determine risk level with proper LP consideration
   let level, emoji, color;
   if (riskPercentage >= 50 || analysis.liquidity.lpRiskLevel === "CRITICAL") {
     level = "HIGH RISK";
@@ -1283,7 +1362,6 @@ function calculateComprehensiveRisk(analysis) {
     color = "success";
   }
 
-  // Generate trader insights
   const insights = generateTraderInsights(analysis, riskPercentage);
 
   return {
@@ -1300,7 +1378,6 @@ function calculateComprehensiveRisk(analysis) {
 function generateTraderInsights(analysis, riskPercentage) {
   const insights = [];
   
-  // CRITICAL WARNINGS FIRST
   if (analysis.liquidity.lpRiskLevel === "CRITICAL") {
     insights.push("🚨 CRITICAL: LP is UNLOCKED and UNBURNED - EXTREME RUG PULL RISK");
     insights.push("⚠️ Only trade with money you can afford to lose completely");
@@ -1309,8 +1386,7 @@ function generateTraderInsights(analysis, riskPercentage) {
     insights.push("⚠️ Use extreme caution - consider waiting for better LP protection");
   }
   
-  // Positive factors
-  if (analysis.ownership.renounceable) {
+  if (analysis.ownership.renounceable || analysis.ownership.owner === "RENOUNCED") {
     insights.push("✅ Ownership renounced - reduced rug risk");
   }
   
@@ -1336,7 +1412,6 @@ function generateTraderInsights(analysis, riskPercentage) {
     insights.push("🔐 High security score - clean contract");
   }
 
-  // Risk warnings
   if (analysis.taxes.buyTax > 10 || analysis.taxes.sellTax > 10) {
     insights.push("⚠️ High taxes may impact profitability - consider tax efficiency");
   }
@@ -1344,12 +1419,7 @@ function generateTraderInsights(analysis, riskPercentage) {
   if (analysis.holderAnalysis.top10Concentration > 40) {
     insights.push(`🐋 Top 10 holders control ${analysis.holderAnalysis.top10Concentration.toFixed(1)}% - watch for coordinated dumps`);
   }
-  
-  if (!analysis.taxes.hasHighLimits) {
-    insights.push("🔒 Low max tx/wallet limits may cause slippage on larger trades");
-  }
 
-  // Trading recommendations
   if (riskPercentage < 25 && analysis.liquidity.lpRiskLevel === "LOW") {
     insights.push("📈 Suitable for swing trading - set stop losses at 15-20%");
   } else if (riskPercentage < 40 && analysis.liquidity.lpRiskLevel !== "CRITICAL") {
@@ -1362,14 +1432,10 @@ function generateTraderInsights(analysis, riskPercentage) {
     insights.push(`📊 Strong community interest: ${analysis.activity.uniqueBuyers24h} unique buyers in 24h`);
   }
 
-  if (analysis.activity.totalTransactions24h > 100) {
-    insights.push(`🔥 High volume: ${analysis.activity.totalTransactions24h} transactions in 24h`);
-  }
-
   return insights.length > 0 ? insights.join("\n") : "⚠️ No specific insights - CRITICAL: DYOR immediately";
 }
 
-// 🔥 FIXED: Enhanced report formatting with REAL supply data from Blockscout
+// 🔥 FIXED: Enhanced report formatting with REAL V2 supply data
 function formatAnalysisReport(analysis) {
   const { riskAssessment, tokenInfo, ownership, taxes, liquidity, holderAnalysis, 
           simulation, activity, security, contractAnalysis, pairCreationInfo } = analysis;
@@ -1379,14 +1445,12 @@ function formatAnalysisReport(analysis) {
       .map((h, i) => `${i + 1}. <code>${h.address.slice(0, 6)}...</code>: ${h.percent.toFixed(2)}%`)
       .join("\n") : "No holder data available";
 
-  // FIXED: Format contract age
   let contractAge = "Unknown";
   if (pairCreationInfo && pairCreationInfo.timestamp) {
     const ageDays = liquidity.lpAgeDays || Math.floor((Date.now() / 1000 - Number(pairCreationInfo.timestamp)) / 86400);
     contractAge = `${ageDays} days`;
   }
 
-  // FIXED: Format LP details with explicit risk warnings
   let lpDetails = liquidity.lpStatus;
   if (liquidity.lpRiskLevel === "CRITICAL") {
     lpDetails = `🚨 ${liquidity.lpStatus}`;
@@ -1397,12 +1461,16 @@ function formatAnalysisReport(analysis) {
     lpDetails += `\n   └─ Unlocks: ${liquidity.unlockDate}`;
   }
 
-  // 🔥 FIXED: Format total supply properly from Blockscout/contract
+  // 🔥 FIXED: Format total supply properly from V2 API/contract
   let formattedSupply = "Unknown";
   if (tokenInfo.totalSupply && tokenInfo.totalSupply > 0n) {
     try {
       const supplyNumber = Number(ethers.formatUnits(tokenInfo.totalSupply, tokenInfo.decimals));
-      if (supplyNumber >= 1000000) {
+      if (isNaN(supplyNumber)) {
+        formattedSupply = tokenInfo.totalSupply.toString();
+      } else if (supplyNumber >= 1000000000) {
+        formattedSupply = (supplyNumber / 1000000000).toFixed(1) + "B";
+      } else if (supplyNumber >= 1000000) {
         formattedSupply = (supplyNumber / 1000000).toFixed(1) + "M";
       } else if (supplyNumber >= 1000) {
         formattedSupply = (supplyNumber / 1000).toFixed(0) + "K";
@@ -1410,12 +1478,7 @@ function formatAnalysisReport(analysis) {
         formattedSupply = supplyNumber.toLocaleString();
       }
       
-      // For very small supplies, show full precision
-      if (supplyNumber < 1) {
-        formattedSupply = ethers.formatUnits(tokenInfo.totalSupply, tokenInfo.decimals);
-      }
-      
-      console.log(`✅ Formatted supply: ${formattedSupply} (raw: ${tokenInfo.totalSupply})`);
+      console.log(`✅ Formatted supply: ${formattedSupply} (raw: ${tokenInfo.totalSupply.toString()})`);
     } catch (e) {
       console.log("Supply formatting error:", e.message);
       formattedSupply = tokenInfo.totalSupply.toString();
@@ -1427,13 +1490,13 @@ function formatAnalysisReport(analysis) {
     "",
     `<b>📋 TOKEN OVERVIEW</b>`,
     `<code>${tokenInfo.name || 'Unknown'}</code> (<code>${tokenInfo.symbol || '???'}</code>)`,
-    `Total Supply: <code>${formattedSupply}</code>`, // 🔥 FIXED: Now shows REAL supply
+    `Total Supply: <code>${formattedSupply}</code>`,
     `Contract Age: ${contractAge}`,
     `Contract: ${contractAnalysis.isContract ? "✅ Deployed" : "❌ Not a contract"}`,
     `Verified: ${ownership.verified ? "✅ Verified Source Code" : "⚠️ Unverified"}`,
     "",
     `<b>👑 OWNERSHIP</b>`,
-    `Owner: <code>${ownership.owner === ethers.ZeroAddress ? "RENOUNCED" : (ownership.owner || "Unknown")}</code>`,
+    `Owner: <code>${ownership.owner}</code>`,
     `Risk Level: <b>${ownership.ownershipRisk}</b>`,
     `${ownership.canRenounce ? "🔓 Can renounce ownership" : "🔒 Ownership fixed"}`,
     "",
@@ -1487,7 +1550,6 @@ function formatAnalysisReport(analysis) {
 }
 
 function getTradingRecommendation(riskPercentage, lpRiskLevel) {
-  // FIXED: LP risk overrides general risk assessment
   if (lpRiskLevel === "CRITICAL") {
     return "🚨 EXTREME RISK - AVOID or use MINIMAL position size only";
   } else if (lpRiskLevel === "HIGH") {
@@ -1499,49 +1561,6 @@ function getTradingRecommendation(riskPercentage, lpRiskLevel) {
   if (riskPercentage < 55) return "🟡 Trade with caution - use 10% stop loss, small positions";
   if (riskPercentage < 70) return "🟠 High risk - only for experienced traders";
   return "🔴 Extreme risk - avoid or use minimal position size";
-}
-
-// Legacy compatibility function (your original calculateRisk)
-function calculateRisk({ buyTax, sellTax, lpPercentBurned, holders }) {
-  let score = 0;
-  let holderComment = "Healthy";
-  let taxComment = "Reasonable";
-  let lpComment = "Sufficiently burned/locked";
-  let traderInsights = "Token looks safe for trading.";
-
-  // ✅ Exclude dead/zero addresses before checking whale %
-  const filteredHolders = holders.filter(
-    (h) =>
-      !h.address.toLowerCase().includes("dead") &&
-      h.address.toLowerCase() !== "0x0000000000000000000000000000000000000000"
-  );
-
-  const biggestHolder = filteredHolders.length > 0 ? filteredHolders[0] : null;
-
-  if (buyTax > 10 || sellTax > 10) {
-    score += 2;
-    taxComment = "⚠️ High tax - possible honeypot.";
-  }
-  if (lpPercentBurned < 50) {
-    score += 2;
-    lpComment = "🚨 LOW BURN/LOCK - HIGH RUG PULL RISK."; // FIXED: More explicit warning
-  }
-  if (biggestHolder && biggestHolder.percent > 30) {
-    score += 2;
-    holderComment = `⚠️ Whale holds >${biggestHolder.percent.toFixed(2)}% supply.`;
-  }
-
-  if (score >= 4) traderInsights = "🚨 HIGH RUG RISK — AVOID OR TRADE EXTREMELY CAUTIOUSLY.";
-  else if (score >= 2) traderInsights = "⚠️ MODERATE RISK — DYOR BEFORE BUYING.";
-
-  return {
-    emoji: score >= 4 ? "🔴" : score >= 2 ? "🟡" : "🟢",
-    label: score >= 4 ? "HIGH RISK" : score >= 2 ? "MEDIUM RISK" : "SAFE",
-    holderComment,
-    taxComment,
-    lpComment,
-    traderInsights,
-  };
 }
 
 export default { analyzeToken };
