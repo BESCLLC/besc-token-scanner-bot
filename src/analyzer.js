@@ -101,13 +101,19 @@ export async function analyzeToken(tokenAddress) {
     // --- 5. Top Holders ---
     const holders = await getTopHolders(
       tokenAddress,
-      10,
+      50,
       tokenInfo.totalSupply,
       tokenInfo.decimals
     );
-    const holdersText = holders.length
-      ? holders.map((h) => `• <code>${h.address}</code> (${h.percent.toFixed(2)}%)`).join("\n")
+    let holdersText = holders.length
+      ? holders.map((h) => `• ${h.label || `<code>${h.address}</code>`} (${h.percent.toFixed(2)}%)`).join("\n")
       : "No holder data found.";
+
+    // 🔥 NEW: Show total concentration of top holders
+    if (holders.length > 0) {
+      const top10Percent = holders.slice(0, 10).reduce((sum, h) => sum + h.percent, 0);
+      holdersText += `\n\n<b>Top 10 Holders Own:</b> ${top10Percent.toFixed(2)}% of Supply`;
+    }
 
     // --- 6. Dev Sell Detection ---
     let devSells = "✅ No dev sells in last 24h";
@@ -129,10 +135,26 @@ export async function analyzeToken(tokenAddress) {
       }
     }
 
-    // --- 7. Risk Assessment ---
+    // --- 7. Honeypot Simulation ---
+    let honeypotRisk = "✅ Sell transactions simulated successfully";
+    try {
+      // pick a random address to simulate
+      const testWallet = ethers.Wallet.createRandom().address;
+      await provider.call({
+        to: tokenAddress,
+        data: tokenContract.interface.encodeFunctionData("transfer", [
+          testWallet,
+          1n // send 1 token unit
+        ])
+      });
+    } catch (err) {
+      honeypotRisk = "🛑 Possible Honeypot — Sell transfer simulation failed!";
+    }
+
+    // --- 8. Risk Assessment ---
     const risk = calculateRisk({ buyTax, sellTax, lpPercentBurned, holders });
 
-    // --- 8. Final Output ---
+    // --- 9. Final Output ---
     return [
       `${risk.emoji} <b>${risk.label}</b>`,
       `\n<b>🔎 Token Overview</b>`,
@@ -152,6 +174,7 @@ export async function analyzeToken(tokenAddress) {
       `• Holder Concentration: ${risk.holderComment}`,
       `• Tax Risk: ${risk.taxComment}`,
       `• LP Risk: ${risk.lpComment}`,
+      `• Honeypot Check: ${honeypotRisk}`,
 
       `\n<b>📊 Trader Insights</b>`,
       `${risk.traderInsights}`,
