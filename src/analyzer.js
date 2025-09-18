@@ -6,13 +6,14 @@ import { createRequire } from "module";
 const require = createRequire(import.meta.url);
 const lpAbi = require("./abi/LP.json");
 const lockerAbi = require("./abi/Locker.json");
-const routerAbi = require("./abi/Router.json"); // <-- NEW: import router ABI
+const routerAbi = require("./abi/Router.json"); // NEW: Router ABI support
 
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
-const ROUTER_ADDRESS = process.env.ROUTER_ADDRESS; // <-- Make sure this is set in .env
+const ROUTER_ADDRESS = process.env.ROUTER_ADDRESS; // must be set in .env
 const FACTORY_ADDRESS = process.env.FACTORY_ADDRESS;
 const LOCKER_ADDRESS = process.env.LOCKER_ADDRESS;
-const BASE_URL = process.env.BLOCKSCOUT_API || "https://explorer.beschyperchain.com/api/v2";
+const BASE_URL =
+  process.env.BLOCKSCOUT_API || "https://explorer.beschyperchain.com/api/v2";
 
 export async function analyzeToken(tokenAddress) {
   try {
@@ -34,7 +35,7 @@ export async function analyzeToken(tokenAddress) {
         "function liquidityFeeSell() view returns (uint256)",
         "function marketingFeeSell() view returns (uint256)",
         "function rewardsFeeSell() view returns (uint256)",
-        "function teamFeeSell() view returns (uint256)"
+        "function teamFeeSell() view returns (uint256)",
       ],
       provider
     );
@@ -62,7 +63,7 @@ export async function analyzeToken(tokenAddress) {
       ["liquidityFeeSell", "sell"],
       ["marketingFeeSell", "sell"],
       ["rewardsFeeSell", "sell"],
-      ["teamFeeSell", "sell"]
+      ["teamFeeSell", "sell"],
     ];
     for (const [fn, type] of taxFns) {
       try {
@@ -82,9 +83,13 @@ export async function analyzeToken(tokenAddress) {
       if (lpPair && lpPair !== ethers.ZeroAddress) {
         const lp = new ethers.Contract(lpPair, lpAbi, provider);
         const lpSupply = await lp.totalSupply();
-
-        const deadBalance = await lp.balanceOf("0x000000000000000000000000000000000000dEaD");
-        lpPercentBurned = lpSupply > 0n ? Number((deadBalance * 10000n) / lpSupply) / 100 : 0;
+        const deadBalance = await lp.balanceOf(
+          "0x000000000000000000000000000000000000dEaD"
+        );
+        lpPercentBurned =
+          lpSupply > 0n
+            ? Number((deadBalance * 10000n) / lpSupply) / 100
+            : 0;
 
         pairedToken = await lp.token0();
         const token1 = await lp.token1();
@@ -98,7 +103,9 @@ export async function analyzeToken(tokenAddress) {
           const locker = new ethers.Contract(LOCKER_ADDRESS, lockerAbi, provider);
           const locks = await locker.getUserLocks(lpPair);
           if (locks && locks.length > 0) {
-            const unlockTime = Math.max(...locks.map((l) => Number(l.unlockTime)));
+            const unlockTime = Math.max(
+              ...locks.map((l) => Number(l.unlockTime))
+            );
             const unlockDate = new Date(unlockTime * 1000);
             lpStatus = `🔒 LP Locked until ${unlockDate.toLocaleDateString()}`;
           }
@@ -108,15 +115,31 @@ export async function analyzeToken(tokenAddress) {
       console.log("LP check failed:", err.message);
     }
 
-    // --- 5. Top Holders (limit to 7 for readability) ---
-    const holders = await getTopHolders(tokenAddress, 50, tokenInfo.totalSupply, tokenInfo.decimals);
+    // --- 5. Top Holders (limit to 7) ---
+    const holders = await getTopHolders(
+      tokenAddress,
+      50,
+      tokenInfo.totalSupply,
+      tokenInfo.decimals
+    );
     const topHoldersDisplay = holders.slice(0, 7);
     let holdersText = topHoldersDisplay.length
-      ? topHoldersDisplay.map((h) => `• ${h.label || `<code>${h.address}</code>`} (${h.percent.toFixed(2)}%)`).join("\n")
+      ? topHoldersDisplay
+          .map(
+            (h) =>
+              `• ${h.label || `<code>${h.address}</code>`} (${h.percent.toFixed(
+                2
+              )}%)`
+          )
+          .join("\n")
       : "No holder data found.";
     if (holders.length > 0) {
-      const top10Percent = holders.slice(0, 10).reduce((sum, h) => sum + h.percent, 0);
-      holdersText += `\n\n<b>Top 10 Holders Own:</b> ${top10Percent.toFixed(2)}% of Supply`;
+      const top10Percent = holders
+        .slice(0, 10)
+        .reduce((sum, h) => sum + h.percent, 0);
+      holdersText += `\n\n<b>Top 10 Holders Own:</b> ${top10Percent.toFixed(
+        2
+      )}% of Supply`;
     }
 
     // --- 6. Dev Sell Detection ---
@@ -140,48 +163,50 @@ export async function analyzeToken(tokenAddress) {
     }
 
     // --- 7. Honeypot Simulation (with revert reason check) ---
-let honeypotRisk = "✅ Sell simulation succeeded";
-try {
-  const testWallet = ethers.Wallet.createRandom().address;
-  await provider.call({
-    to: tokenAddress,
-    data: tokenContract.interface.encodeFunctionData("transfer", [testWallet, 1n])
-  });
-} catch (transferErr) {
-  console.log("Direct transfer failed, trying Router swap simulation...");
-  try {
-    if (lpPair) {
-      const lp = new ethers.Contract(lpPair, lpAbi, provider);
-      const token0 = await lp.token0();
-      const token1 = await lp.token1();
-      const pairedToken = token0 === tokenAddress ? token1 : token0;
-
-      const router = new ethers.Contract(process.env.ROUTER_ADDRESS, [
-        "function swapExactTokensForTokensSupportingFeeOnTransferTokens(uint amountIn,uint amountOutMin,address[] path,address to,uint deadline)"
-      ], provider);
-
-      const callData = router.interface.encodeFunctionData(
-        "swapExactTokensForTokensSupportingFeeOnTransferTokens",
-        [ethers.parseUnits("1", tokenInfo.decimals), 0, [tokenAddress, pairedToken], testWallet, Math.floor(Date.now() / 1000) + 60]
-      );
-
-      await provider.call({ to: process.env.ROUTER_ADDRESS, data: callData });
-      honeypotRisk = "✅ Router swap simulation passed (sell possible)";
-    } else {
-      honeypotRisk = "⚠️ No LP pair found — cannot simulate sell.";
+    let honeypotRisk = "✅ Sell simulation succeeded";
+    try {
+      const testWallet = ethers.Wallet.createRandom().address;
+      await provider.call({
+        to: tokenAddress,
+        data: tokenContract.interface.encodeFunctionData("transfer", [
+          testWallet,
+          1n,
+        ]),
+      });
+    } catch (transferErr) {
+      console.log("Direct transfer failed, trying Router swap simulation...");
+      try {
+        if (lpPair && ROUTER_ADDRESS) {
+          const router = new ethers.Contract(ROUTER_ADDRESS, routerAbi, provider);
+          const callData = router.interface.encodeFunctionData(
+            "swapExactTokensForTokensSupportingFeeOnTransferTokens",
+            [
+              ethers.parseUnits("1", tokenInfo.decimals),
+              0,
+              [tokenAddress, pairedToken],
+              ethers.Wallet.createRandom().address,
+              Math.floor(Date.now() / 1000) + 60,
+            ]
+          );
+          await provider.call({ to: ROUTER_ADDRESS, data: callData });
+          honeypotRisk = "✅ Router swap simulation passed (sell possible)";
+        } else {
+          honeypotRisk = "⚠️ No LP pair found — cannot simulate sell.";
+        }
+      } catch (dexErr) {
+        const reason = dexErr?.message?.toLowerCase() || "";
+        if (
+          reason.includes("transfer amount exceeds balance") ||
+          reason.includes("insufficient allowance") ||
+          reason.includes("transfer_from_failed")
+        ) {
+          honeypotRisk =
+            "⚠️ Simulation reverted due to missing balance/approval (likely safe)";
+        } else {
+          honeypotRisk = "🛑 Possible Honeypot — Swap reverted unexpectedly!";
+        }
+      }
     }
-  } catch (dexErr) {
-    const reason = dexErr?.message?.toLowerCase() || "";
-    if (
-      reason.includes("transfer amount exceeds balance") ||
-      reason.includes("insufficient allowance") ||
-      reason.includes("transfer_from_failed")
-    ) {
-      honeypotRisk = "⚠️ Simulation reverted due to missing balance/approval (likely safe)";
-    } else {
-      honeypotRisk = "🛑 Possible Honeypot — Swap reverted unexpectedly!";
-    }
-  }
 
     // --- 8. Risk Assessment ---
     const risk = calculateRisk({ buyTax, sellTax, lpPercentBurned, holders });
@@ -211,7 +236,7 @@ try {
       `\n<b>📊 Trader Insights</b>`,
       `${risk.traderInsights}`,
 
-      `\n${devSells}`
+      `\n${devSells}`,
     ].join("\n");
   } catch (err) {
     console.error("❌ analyzeToken failed:", err);
@@ -248,7 +273,7 @@ function calculateRisk({ buyTax, sellTax, lpPercentBurned, holders }) {
     holderComment,
     taxComment,
     lpComment,
-    traderInsights
+    traderInsights,
   };
 }
 
