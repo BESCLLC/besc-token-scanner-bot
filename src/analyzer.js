@@ -89,7 +89,7 @@ const LOCKER_ABI = [
 
 const routerAbi = require("./abi/Router.json");
 
-// 🔥 FIXED: Correct V2 Blockscout API base URL
+// 🔥 FIXED: Correct Blockscout API base URL
 const BASE_URL = process.env.BLOCKSCOUT_API || "https://explorer.beschyperchain.com/api/v2";
 
 // ✅ Only check LPs against your chain's base tokens
@@ -233,10 +233,10 @@ async function fetchTokenInfoFromContract(tokenAddress) {
   }
 }
 
-// 🔥 FIXED: V2 Blockscout API - Proper holders endpoint
+// 🔥 FIXED: Working holders endpoint from your example
 export async function getFixedTopHolders(tokenAddress, limit = 100, totalSupply, decimals) {
   try {
-    console.log(`🔍 Getting top holders from Blockscout V2 for ${tokenAddress}, limit: ${limit}`);
+    console.log(`🔍 Getting top holders for ${tokenAddress}, limit: ${limit}`);
     
     // ✅ FIXED: Ensure totalSupply is BigInt and fetch if needed
     if (!totalSupply || typeof totalSupply === 'number' || totalSupply === '0') {
@@ -246,81 +246,54 @@ export async function getFixedTopHolders(tokenAddress, limit = 100, totalSupply,
       console.log(`Updated supply for holders: ${totalSupply.toString()}`);
     }
     
-    // ✅ FIXED: Use V2 endpoint - /tokens/{address_hash}/holders
-    const response = await axios.get(`${BASE_URL}/tokens/${tokenAddress.toLowerCase()}/holders`, {
-      params: {
-        filter: "all", // or "top" for top holders
-        items_count: limit
-      },
+    // ✅ FIXED: Use the WORKING endpoint structure you provided
+    const url = `${BASE_URL}/tokens/${tokenAddress}/holders?page=1&limit=${limit}`;
+    console.log(`Fetching holders from: ${url}`);
+    
+    const res = await axios.get(url, {
       timeout: 10000
     });
 
-    console.log("Blockscout V2 holders response status:", response.status);
+    console.log("Holders API response status:", res.status);
+    console.log("Holders API response data structure:", JSON.stringify(res.data, null, 2));
 
-    if (response.data && Array.isArray(response.data) && response.status === 200) {
-      const holders = response.data.map((holder, index) => {
-        // ✅ FIXED: BigInt conversion for all numeric values from V2 API
-        const balance = BigInt(holder.value || holder.balance || 0);
+    if (!res.data.items || res.data.items.length === 0) {
+      console.warn("⚠️ No holders returned by BlockScout for", tokenAddress);
+      return [];
+    }
+
+    console.log(`✅ Found ${res.data.items.length} holders from API`);
+
+    const holders = res.data.items
+      .filter(item => item.value && BigInt(item.value) > 0n)
+      .map((holder, index) => {
+        // ✅ Handle the actual response structure from working endpoint
+        const balance = BigInt(holder.value || 0);
         const total = totalSupply || BigInt(0);
         
-        // ✅ FIXED: Safe percentage calculation with BigInt
+        // ✅ Safe percentage calculation with BigInt
         let percent = 0;
         if (total > 0n) {
-          // Use 4 decimal precision for percentage
           const percentage = (balance * 10000n) / total;
           percent = Number(percentage) / 100;
         }
         
         return {
-          address: holder.address || holder.token_holder_address || `0x${'0'.repeat(40)}`,
+          address: holder.address_hash || holder.address || `0x${'0'.repeat(40)}`,
           amount: balance,
-          percent: Math.min(Math.max(percent, 0), 100), // Clamp between 0-100%
+          percent: Math.min(Math.max(percent, 0), 100),
           rank: index + 1,
           value: Number(ethers.formatUnits(balance, decimals || 18))
         };
-      }).filter(h => h.amount > 0n); // Filter out zero balance holders
-
-      console.log(`✅ Fetched ${holders.length} holders from V2 API`);
-      return holders.slice(0, limit); // Ensure we don't exceed limit
-    }
-
-    console.log("No holders found in V2 response, trying fallback...");
-    
-    // Fallback: Try old V1 style if V2 fails
-    try {
-      const fallbackResponse = await axios.get(`${BASE_URL.replace('/v2', '')}?module=token&action=tokenholderlist&contractaddress=${tokenAddress}&page=1&offset=${limit}`, {
-        timeout: 5000
       });
-      
-      if (fallbackResponse.data.status === "1" && fallbackResponse.data.result) {
-        console.log("✅ Fallback to V1 holders successful");
-        return fallbackResponse.data.result.map((holder, index) => {
-          const balance = BigInt(holder.balance || 0);
-          const total = totalSupply || BigInt(0);
-          
-          let percent = 0;
-          if (total > 0n) {
-            percent = Number((balance * 10000n) / total) / 100;
-          }
-          
-          return {
-            address: holder.TokenHolderAddress || `0x${'0'.repeat(40)}`,
-            amount: balance,
-            percent: Math.min(percent, 100),
-            rank: index + 1
-          };
-        });
-      }
-    } catch (fallbackErr) {
-      console.log("V1 fallback also failed:", fallbackErr.message);
-    }
 
-    console.log("No holders found, returning empty array");
-    return [];
+    console.log(`✅ Processed ${holders.length} valid holders with non-zero balances`);
+    return holders.slice(0, limit);
+
   } catch (err) {
     console.error("❌ getFixedTopHolders failed:", err.message);
     if (err.response) {
-      console.error("Response data:", err.response.data);
+      console.error("Response data:", JSON.stringify(err.response.data, null, 2));
     }
     return [];
   }
@@ -361,7 +334,7 @@ export async function analyzeToken(tokenAddress) {
     const contractAnalysis = await analyzeContractFeatures(tokenAddress);
     const verified = tokenInfo.verified || await checkContractVerified(tokenAddress);
     
-    // 🔥 FIXED: Use our fixed holders function with V2 API
+    // 🔥 FIXED: Use our fixed holders function with WORKING endpoint
     const holderAnalysis = await analyzeHolderDistribution(tokenAddress, tokenInfo);
     
     // 🔥 FIXED: Better pair creation info
@@ -647,10 +620,12 @@ async function analyzeTaxes(tokenContract, totalSupply) {
   };
 }
 
-// 🔥 FIXED: Enhanced holder distribution with BigInt safety and V2 API
+// 🔥 FIXED: Enhanced holder distribution with working endpoint
 async function analyzeHolderDistribution(tokenAddress, tokenInfo) {
   try {
     const allHolders = await getFixedTopHolders(tokenAddress, 100, tokenInfo.totalSupply, tokenInfo.decimals);
+    
+    console.log(`Raw holders fetched: ${allHolders.length}`);
     
     // Filter out burn addresses and contract itself
     const liveHolders = allHolders.filter(h => 
@@ -660,6 +635,8 @@ async function analyzeHolderDistribution(tokenAddress, tokenInfo) {
       h.amount > 0n
     );
 
+    console.log(`Live holders after filtering: ${liveHolders.length}`);
+    
     const top10Percent = liveHolders.slice(0, 10).reduce((sum, h) => sum + h.percent, 0);
     const giniCoefficient = calculateGiniCoefficient(liveHolders);
     const holderCount = liveHolders.length;
@@ -714,7 +691,7 @@ async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo) {
   let lpPair = null;
   let pairedToken = null;
   let liquidityValue = "Unknown";
-  let lpAgeDays = 0;
+  let lpAgeHours = 0;
   let lpLocked = false;
   let lockedAmount = 0n;
   let lockedPercent = 0;
@@ -740,10 +717,10 @@ async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo) {
       const token1 = await lpContract.token1();
       pairedToken = token0.toLowerCase() === tokenAddress.toLowerCase() ? token1 : token0;
 
-      // Calculate LP age
+      // Calculate LP age in hours
       if (pairCreationInfo && pairCreationInfo.timestamp) {
         const now = Math.floor(Date.now() / 1000);
-        lpAgeDays = Math.floor((now - Number(pairCreationInfo.timestamp)) / 86400);
+        lpAgeHours = Math.floor((now - Number(pairCreationInfo.timestamp)) / 3600);
       }
 
       // === REAL LOCKER CHECKING ===
@@ -801,7 +778,7 @@ async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo) {
     lpPercentBurned,
     lpPair,
     pairedToken,
-    lpAgeDays,
+    lpAgeHours,
     hasLiquidity: !!lpPair,
     lpLocked,
     lockedAmount,
@@ -1446,12 +1423,10 @@ function formatAnalysisReport(analysis) {
       .join("\n") : "No holder data available";
 
   let contractAge = "Unknown";
-if (pairCreationInfo && pairCreationInfo.timestamp) {
-  const ageHours =
-    liquidity.lpAgeHours ||
-    Math.floor((Date.now() / 1000 - Number(pairCreationInfo.timestamp)) / 3600);
-  contractAge = `${ageHours} hours`;
-}
+  if (pairCreationInfo && pairCreationInfo.timestamp) {
+    const ageHours = liquidity.lpAgeHours || Math.floor((Date.now() / 1000 - Number(pairCreationInfo.timestamp)) / 3600);
+    contractAge = `${ageHours} hours`;
+  }
 
   let lpDetails = liquidity.lpStatus;
   if (liquidity.lpRiskLevel === "CRITICAL") {
