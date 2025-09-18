@@ -140,33 +140,44 @@ export async function analyzeToken(tokenAddress) {
     }
 
     // --- 7. Honeypot Simulation with Router Fallback ---
-    let honeypotRisk = "✅ Sell simulation succeeded";
-    try {
-      const testWallet = ethers.Wallet.createRandom().address;
-      await provider.call({
-        to: tokenAddress,
-        data: tokenContract.interface.encodeFunctionData("transfer", [testWallet, 1n])
-      });
-    } catch (transferErr) {
-      console.log("Direct transfer failed, trying Router swap simulation...");
-      try {
-        if (ROUTER_ADDRESS && pairedToken) {
-          const router = new ethers.Contract(ROUTER_ADDRESS, routerAbi, provider);
-          const path = [tokenAddress, pairedToken];
-          const deadline = Math.floor(Date.now() / 1000) + 60;
-          const data = router.interface.encodeFunctionData(
-            "swapExactTokensForTokensSupportingFeeOnTransferTokens",
-            [ethers.parseUnits("1", tokenInfo.decimals), 0, path, ethers.ZeroAddress, deadline]
-          );
-          await provider.call({ to: ROUTER_ADDRESS, data });
-          honeypotRisk = "✅ Router swap simulation passed";
-        } else {
-          honeypotRisk = "⚠️ No router/pair found — cannot simulate sell.";
-        }
-      } catch (dexErr) {
-        honeypotRisk = "🛑 Possible Honeypot — Router swap reverted!";
-      }
+let honeypotRisk = "✅ Sell simulation succeeded";
+try {
+  const testWallet = ethers.Wallet.createRandom().address;
+  await provider.call({
+    to: tokenAddress,
+    data: tokenContract.interface.encodeFunctionData("transfer", [testWallet, 1n])
+  });
+} catch (transferErr) {
+  console.log("Direct transfer failed, trying Router swap simulation with allowance...");
+  try {
+    if (ROUTER_ADDRESS && pairedToken) {
+      const router = new ethers.Contract(ROUTER_ADDRESS, routerAbi, provider);
+      const path = [tokenAddress, pairedToken];
+      const deadline = Math.floor(Date.now() / 1000) + 60;
+
+      // 1️⃣ Approve simulation
+      const approveData = tokenContract.interface.encodeFunctionData("approve", [
+        ROUTER_ADDRESS,
+        ethers.MaxUint256
+      ]);
+      await provider.call({ to: tokenAddress, data: approveData });
+
+      // 2️⃣ Swap simulation
+      const data = router.interface.encodeFunctionData(
+        "swapExactTokensForTokensSupportingFeeOnTransferTokens",
+        [ethers.parseUnits("1", tokenInfo.decimals), 0, path, testWallet, deadline]
+      );
+      await provider.call({ to: ROUTER_ADDRESS, data });
+
+      honeypotRisk = "✅ Router swap simulation passed (sell possible)";
+    } else {
+      honeypotRisk = "⚠️ No router/pair found — cannot simulate sell.";
     }
+  } catch (dexErr) {
+    console.error("Router simulation error:", dexErr.message);
+    honeypotRisk = "🛑 Possible Honeypot — Router swap still reverted!";
+  }
+}
 
     // --- 8. Risk Assessment ---
     const risk = calculateRisk({ buyTax, sellTax, lpPercentBurned, holders });
