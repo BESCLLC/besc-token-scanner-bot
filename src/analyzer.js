@@ -153,6 +153,10 @@ const ENHANCED_TOKEN_ABI = [
   "event Transfer(address indexed from, address indexed to, uint256 value)",
   "event Approval(address indexed owner, address indexed spender, uint256 value)",
   "function deployer() view returns (address)",
+  "function devWallet() view returns (address)",
+  "function marketingWallet() view returns (address)",
+  "function lpWallet() view returns (address)",
+  "function buybackWallet() view returns (address)",
   "function getOwner() view returns (address)",
   "function owner() view returns (address)",
   "function pair() view returns (address)",
@@ -385,12 +389,20 @@ async function checkContractVerified(address) {
   }
 }
 
-// 🔥 NEW: Fetch deployer directly from contract read functions
-async function fetchDeployer(tokenAddress) {
+// 🔥 NEW: Fetch potential locker users (deployer, owner, devWallet, etc.)
+async function fetchPotentialLockerUsers(tokenAddress) {
+  const users = new Set();
   try {
-    const methods = ["deployer", "getOwner", "owner", "admin"];
+    const methods = [
+      "deployer", "devWallet", "marketingWallet", "lpWallet", "buybackWallet",
+      "getOwner", "owner", "admin"
+    ];
     const tokenContract = new ethers.Contract(tokenAddress, [
       "function deployer() view returns (address)",
+      "function devWallet() view returns (address)",
+      "function marketingWallet() view returns (address)",
+      "function lpWallet() view returns (address)",
+      "function buybackWallet() view returns (address)",
       "function getOwner() view returns (address)",
       "function owner() view returns (address)",
       "function admin() view returns (address)"
@@ -399,21 +411,19 @@ async function fetchDeployer(tokenAddress) {
     for (const method of methods) {
       try {
         const addr = await tokenContract[method]();
-        if (addr && addr !== ethers.ZeroAddress) {
-          console.log(`✅ Fetched deployer via ${method}: ${addr}`);
-          return addr;
+        if (addr && addr !== ethers.ZeroAddress && !users.has(addr)) {
+          users.add(addr);
+          console.log(`✅ Found potential locker via ${method}: ${addr}`);
         }
       } catch (methodErr) {
         console.log(`Method ${method} failed:`, methodErr.message);
       }
     }
-
-    console.log("⚠️ No deployer found via contract reads");
-    return null;
   } catch (err) {
-    console.log("Deployer fetch failed:", err.message);
-    return null;
+    console.log("Potential users fetch failed:", err.message);
   }
+
+  return Array.from(users);
 }
 
 // 🔥 FIXED: Get contract creation time and deployer for accurate age calculation and lock checking
@@ -422,8 +432,12 @@ async function getContractCreationTime(tokenAddress) {
   try {
     console.log(`🔍 Fetching contract creation time and deployer for ${tokenAddress}`);
     
-    // First, try contract read for deployer
-    deployer = await fetchDeployer(tokenAddress);
+    // First, try contract read for potential users
+    const potentialUsers = await fetchPotentialLockerUsers(tokenAddress);
+    if (potentialUsers.length > 0) {
+      deployer = potentialUsers[0]; // Use first as primary deployer
+      console.log(`Using primary potential locker: ${deployer}`);
+    }
     
     // Try V2 API first for contract creation
     const response = await axios.get(`${BASE_URL}/smart-contracts/${tokenAddress.toLowerCase()}`, {
@@ -438,7 +452,8 @@ async function getContractCreationTime(tokenAddress) {
         blockNumber,
         timestamp: block.timestamp,
         ageHours: Math.floor((Date.now() / 1000 - Number(block.timestamp)) / 3600),
-        deployer // Use fetched deployer
+        deployer,
+        potentialUsers
       };
     }
     
@@ -458,51 +473,9 @@ async function getContractCreationTime(tokenAddress) {
         blockNumber: creationTx.block_number,
         timestamp: block.timestamp,
         ageHours: Math.floor((Date.now() / 1000 - Number(block.timestamp)) / 3600),
-        deployer
+        deployer,
+        potentialUsers
       };
-    }
-    
-    // 🔥 NEW: RPC-based fallback to find creation block and deployer
-    console.log("🔍 Using RPC linear search for creation block and deployer");
-    const latestBlockNum = await provider.getBlockNumber();
-    let creationBlockNum = null;
-    let prevCode = "0x";
-    for (let i = 0; i < 5000; i++) {  // Limit search to recent 5000 blocks
-      const blockNum = latestBlockNum - i;
-      if (blockNum < 0) break;
-      try {
-        const code = await provider.getCode(tokenAddress, blockNum);
-        if (code !== "0x" && prevCode === "0x") {
-          creationBlockNum = blockNum;
-          break;
-        }
-        prevCode = code;
-      } catch (err) {
-        console.log(`getCode failed for block ${blockNum}:`, err.message);
-      }
-    }
-
-    if (creationBlockNum !== null) {
-      const block = await provider.getBlock(creationBlockNum);
-      const txHashes = await block.transactions;
-      for (const txHash of txHashes) {
-        try {
-          const receipt = await provider.getTransactionReceipt(txHash);
-          if (receipt && receipt.contractAddress && receipt.contractAddress.toLowerCase() === tokenAddress.toLowerCase()) {
-            const rpcDeployer = receipt.from;
-            deployer = deployer || rpcDeployer;
-            console.log(`✅ Found creation via RPC: block ${creationBlockNum}, tx ${txHash}, deployer ${deployer}`);
-            return {
-              blockNumber: creationBlockNum,
-              timestamp: block.timestamp,
-              ageHours: Math.floor((Date.now() / 1000 - Number(block.timestamp)) / 3600),
-              deployer
-            };
-          }
-        } catch (receiptErr) {
-          console.log(`Receipt fetch failed for ${txHash}:`, receiptErr.message);
-        }
-      }
     }
     
     // Final fallback: Estimate from recent blocks
@@ -517,6 +490,7 @@ async function getContractCreationTime(tokenAddress) {
       timestamp: estimatedBlockData.timestamp,
       ageHours: estimatedAgeHours,
       deployer,
+      potentialUsers,
       estimated: true
     };
     
@@ -531,6 +505,7 @@ async function getContractCreationTime(tokenAddress) {
       timestamp: Math.floor(Date.now() / 1000) - (fallbackAge * 3600),
       ageHours: fallbackAge,
       deployer,
+      potentialUsers: [],
       estimated: true
     };
   }
@@ -604,7 +579,8 @@ export async function analyzeToken(tokenAddress) {
 
     // --- 5. Liquidity & LP Analysis with FIXED risk ---
     const deployer = contractCreationInfo.deployer;
-    const liquidity = await analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo, deployer);
+    const potentialUsers = contractCreationInfo.potentialUsers || [];
+    const liquidity = await analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo, deployer, potentialUsers);
 
     // --- 6. Honeypot & Simulation ---
     const simulation = await simulateTrading(tokenAddress, tokenInfo, liquidity);
@@ -766,7 +742,7 @@ async function analyzeOwnership(tokenContract, tokenAddress) {
   let ownershipRisk = "Low";
 
   try {
-    const ownerMethods = ["deployer", "getOwner", "owner", "admin"];
+    const ownerMethods = ["deployer", "devWallet", "marketingWallet", "lpWallet", "buybackWallet", "getOwner", "owner", "admin"];
     for (const method of ownerMethods) {
       try {
         owner = await tokenContract[method]();
@@ -941,7 +917,7 @@ function calculateGiniCoefficient(holders) {
 }
 
 // 🔥 FIXED: Liquidity analysis with better error handling and deployer-based lock check
-async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo, deployer) {
+async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo, deployer, potentialUsers = []) {
   let lpStatus = "⚠️ No LP found";
   let lpPercentBurned = 0;
   let lpPair = null;
@@ -981,7 +957,7 @@ async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo, deplo
 
       // === REAL LOCKER CHECKING ===
       if (LOCKER_ADDRESS) {
-        const lockStatus = await checkLockerStatus(lpPair, lpSupply, deployer);
+        const lockStatus = await checkLockerStatus(lpPair, lpSupply, deployer, potentialUsers);
         if (lockStatus.locked) {
           lpLocked = true;
           lockedAmount = lockStatus.lockedAmount;
@@ -1045,59 +1021,48 @@ async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo, deplo
   };
 }
 
-// 🔥 FIXED: Event-based locker status checking by deployer wallet (user filter) to avoid large ranges
-async function checkLockerStatus(lpPair, totalLPSupply, deployer) {
+// 🔥 FIXED: Direct locker status checking via getUserLocks read function
+async function checkLockerStatus(lpPair, totalLPSupply, primaryUser, potentialUsers = []) {
   try {
     if (!LOCKER_ADDRESS) {
       return { locked: false, lockedAmount: 0n, lockedPercent: 0, unlockTime: 0, unlockDate: "N/A" };
     }
 
-    console.log(`🔍 Checking locker status for LP: ${lpPair} via deployer ${deployer || 'unknown'}`);
+    console.log(`🔍 Checking locker status for LP: ${lpPair} via primary user ${primaryUser || 'unknown'}`);
     
     const lockerContract = new ethers.Contract(LOCKER_ADDRESS, LOCKER_ABI, provider);
     
-    let lockedEvents = [];
-    if (deployer) {
-      // 🔥 FIXED: Filter by user (deployer) - indexed first param, query from 0 to latest (few events per user)
-      console.log(`Filtering Locked events by deployer: ${deployer}`);
-      const filter = lockerContract.filters.Locked(deployer);
-      lockedEvents = await lockerContract.queryFilter(filter, 0, "latest");
-      console.log(`Found ${lockedEvents.length} Locked events by deployer ${deployer}`);
-    } else {
-      // Fallback if no deployer: use small recent range on token
-      console.log("No deployer found, falling back to recent token filter");
-      const latestBlockNum = await provider.getBlockNumber();
-      const fromBlockNum = Math.max(0, latestBlockNum - 10000);
-      const filter = lockerContract.filters.Locked(null, null, null, lpPair, null, null);
-      lockedEvents = await queryEventsInBatches(lockerContract, filter, fromBlockNum, latestBlockNum);
-    }
-
-    let totalLockedAmount = 0n;
-    let earliestUnlockTime = 0;
-    let hasActiveLocks = false;
-
     // Get current timestamp
     const latestBlockNum = await provider.getBlockNumber();
     const currentTimestamp = (await provider.getBlock(latestBlockNum)).timestamp;
 
-    // Process each event
-    for (const event of lockedEvents) {
-      const user = event.args.user;
-      const lockId = Number(event.args.lockId);
-      const eventToken = event.args.token;
+    let totalLockedAmount = 0n;
+    let earliestUnlockTime = 0;
+    let hasActiveLocks = false;
+    let checkedUsers = [];
 
-      // Only process if token matches LP pair
-      if (eventToken.toLowerCase() !== lpPair.toLowerCase()) {
-        console.log(`Skipping non-LP lock: token ${eventToken} != ${lpPair}`);
-        continue;
-      }
-
+    // Check primary user first
+    const usersToCheck = primaryUser ? [primaryUser, ...potentialUsers] : potentialUsers;
+    for (const user of usersToCheck) {
+      if (checkedUsers.includes(user)) continue;
+      checkedUsers.push(user);
+      
+      console.log(`Checking locks for user: ${user}`);
       try {
-        // Fetch user's locks to check current status
         const userLocks = await lockerContract.getUserLocks(user);
-        
-        if (lockId < userLocks.length) {
-          const lock = userLocks[lockId];
+        console.log(`Found ${userLocks.length} locks for user ${user}`);
+
+        for (let i = 0; i < userLocks.length; i++) {
+          const lock = userLocks[i];
+          const lockToken = lock.token;
+          const lockId = i; // Assuming index is lockId
+
+          // Only process if token matches LP pair
+          if (lockToken.toLowerCase() !== lpPair.toLowerCase()) {
+            console.log(`Skipping non-LP lock: token ${lockToken} != ${lpPair}`);
+            continue;
+          }
+
           if (!lock.unlocked && currentTimestamp < lock.unlockTime) {
             hasActiveLocks = true;
             totalLockedAmount += lock.amount;
@@ -1126,7 +1091,7 @@ async function checkLockerStatus(lpPair, totalLPSupply, deployer) {
         lockedPercent: Math.min(lockedPercent, 100),
         unlockTime: earliestUnlockTime,
         unlockDate: unlockDate,
-        lockCount: lockedEvents.length // Approximate, but events include all historical
+        lockCount: checkedUsers.length // Number of users checked
       };
     }
 
