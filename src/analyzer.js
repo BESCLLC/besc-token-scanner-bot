@@ -286,7 +286,7 @@ export async function getFixedTopHolders(tokenAddress, limit = 100, totalSupply,
         }
         
         return {
-          address: holder.address_hash || holder.address || `0x${'0'.repeat(40)}`,
+          address: holder.address.hash || holder.address_hash || holder.address || `0x${'0'.repeat(40)}`,
           amount: balance,
           percent: Math.min(Math.max(percent, 0), 100),
           rank: index + 1,
