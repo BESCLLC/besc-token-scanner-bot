@@ -350,25 +350,24 @@ export async function getFixedTopHolders(tokenAddress, limit = 100, totalSupply,
   }
 }
 
-// 🔥 FIXED: V2 Blockscout API - Proper contract verification using Etherscan-compatible endpoint
+// 🔥 FIXED: V2 Blockscout API - Proper contract verification using smart-contracts endpoint
 async function checkContractVerified(address) {
   try {
-    // ✅ FIXED: Use Etherscan-compatible API since V2 smart-contracts endpoint may require module/action params
-    const apiUrl = BASE_URL.replace('/v2', ''); // Remove /v2 to use base API
-    const response = await axios.get(`${apiUrl}?module=contract&action=getsourcecode&address=${address.toLowerCase()}`, {
+    // ✅ FIXED: Use V2 smart-contracts endpoint instead of Etherscan format
+    const response = await axios.get(`${BASE_URL}/smart-contracts/${address.toLowerCase()}`, {
       timeout: 5000
     });
     
-    console.log("Contract verification Etherscan API response:", response.status);
+    console.log("V2 smart-contracts response:", response.status);
     console.log("Response data:", JSON.stringify(response.data, null, 2));
     
-    // Check Etherscan API response format
-    if (response.data && response.data.status === '1' && 
-        response.data.result && Array.isArray(response.data.result) && 
-        response.data.result.length > 0 && 
-        response.data.result[0].SourceCode && 
-        response.data.result[0].SourceCode !== '') {
-      return true;
+    // Check V2 response for verification indicators
+    if (response.data && response.status === 200) {
+      const isVerified = response.data.verified || 
+                         (response.data.source_code && response.data.source_code !== '') || 
+                         (response.data.abi && response.data.abi.length > 0) ||
+                         response.data.name;
+      return !!isVerified;
     }
     
     return false;
@@ -377,6 +376,9 @@ async function checkContractVerified(address) {
       console.log(`Contract ${address} not found/verified on explorer`);
     } else {
       console.log(`Contract verification failed for ${address}:`, err.message);
+      if (err.response) {
+        console.log("Response:", JSON.stringify(err.response.data, null, 2));
+      }
     }
     return false;
   }
@@ -560,8 +562,10 @@ async function getPairCreationInfo(tokenAddress) {
 
     // 🔥 FIXED: Proper event filtering - only filter indexed parameters
     try {
+      const latestBlock = await provider.getBlockNumber();
+      const fromBlock = Math.max(0, latestBlock - 50000);
       const filter = factory.filters.PairCreated(null, null, pair);
-      const events = await factory.queryFilter(filter, -50000, "latest");
+      const events = await factory.queryFilter(filter, fromBlock, "latest");
       
       if (events.length > 0) {
         const event = events[0];
@@ -919,7 +923,7 @@ async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo) {
   };
 }
 
-// 🔥 FIXED: Event-based locker status checking to find all locks for the LP token
+// 🔥 FIXED: Event-based locker status checking to find all locks for the LP token - Limited block range to avoid RPC limits
 async function checkLockerStatus(lpPair, totalLPSupply) {
   try {
     if (!LOCKER_ADDRESS) {
@@ -930,9 +934,14 @@ async function checkLockerStatus(lpPair, totalLPSupply) {
     
     const lockerContract = new ethers.Contract(LOCKER_ADDRESS, LOCKER_ABI, provider);
     
+    // 🔥 FIXED: Limit block range to avoid "Requested range exceeds maximum RPC range limit"
+    const latestBlockNum = await provider.getBlockNumber();
+    const fromBlockNum = Math.max(0, latestBlockNum - 100000); // Covers ~11 days at 12s/block, adjustable if needed
+    console.log(`Querying events from block ${fromBlockNum} to ${latestBlockNum}`);
+    
     // 🔥 FIXED: Query Locked events filtered by token = lpPair (correct parameter position: 4th arg for indexed token)
     const filter = lockerContract.filters.Locked(null, null, null, lpPair, null, null);
-    const lockedEvents = await lockerContract.queryFilter(filter, 0, "latest");
+    const lockedEvents = await lockerContract.queryFilter(filter, fromBlockNum, "latest");
     
     console.log(`Found ${lockedEvents.length} Locked events for LP ${lpPair}`);
 
@@ -941,8 +950,7 @@ async function checkLockerStatus(lpPair, totalLPSupply) {
     let hasActiveLocks = false;
 
     // Get current timestamp
-    const latestBlock = await provider.getBlockNumber();
-    const currentTimestamp = (await provider.getBlock(latestBlock)).timestamp;
+    const currentTimestamp = (await provider.getBlock(latestBlockNum)).timestamp;
 
     // Process each event
     for (const event of lockedEvents) {
@@ -1574,7 +1582,7 @@ function formatAnalysisReport(analysis) {
 
   const holdersText = holderAnalysis.displayHolders.length > 0 ? 
     holderAnalysis.displayHolders
-      .map((h, i) => `${i + 1}. <code>${h.address.slice(0, 6)}...</code>: ${h.percent.toFixed(2)}%`)
+      .map((h, i) => `${i + 1}. ${h.address.slice(0, 6)}...: ${h.percent.toFixed(2)}%`)
       .join("\n") : "No holder data available";
 
   // 🔥 FIXED: Use contract creation time for accurate age calculation
@@ -1631,43 +1639,43 @@ function formatAnalysisReport(analysis) {
   const holdersDisplay = tokenInfo.holdersCount > 0 ? `${tokenInfo.holdersCount} holders` : "0 holders";
 
   return [
-    `${riskAssessment.emoji} <b>${riskAssessment.level}</b> (${riskAssessment.riskPercentage}%)`,
+    `${riskAssessment.emoji} ${riskAssessment.level} (${riskAssessment.riskPercentage}%)`,
     "",
-    `<b>📋 TOKEN OVERVIEW</b>`,
-    `<code>${tokenInfo.name || 'Unknown'}</code> (<code>${tokenInfo.symbol || '???'}</code>)`,
-    `Total Supply: <code>${formattedSupply}</code>`,
+    `📋 TOKEN OVERVIEW`,
+    `${tokenInfo.name || 'Unknown'} (${tokenInfo.symbol || '???'})`,
+    `Total Supply: ${formattedSupply}`,
     `Contract Age: ${contractAge}`,
     `${holdersDisplay}`,
     `Contract: ${contractAnalysis.isContract ? "✅ Deployed" : "❌ Not a contract"}`,
     `Verified: ${ownership.verified ? "✅ Verified Source Code" : "⚠️ Unverified"}`,
     "",
-    `<b>👑 OWNERSHIP</b>`,
-    `Owner: <code>${ownership.owner}</code>`,
-    `Risk Level: <b>${ownership.ownershipRisk}</b>`,
+    `👑 OWNERSHIP`,
+    `Owner: ${ownership.owner}`,
+    `Risk Level: ${ownership.ownershipRisk}`,
     `${ownership.canRenounce ? "🔓 Can renounce ownership" : "🔒 Ownership fixed"}`,
     "",
-    `<b>💰 TAXES & LIMITS</b>`,
-    `Buy Tax: <b>${taxes.buyTax}%</b> | Sell Tax: <b>${taxes.sellTax}%</b>`,
+    `💰 TAXES & LIMITS`,
+    `Buy Tax: ${taxes.buyTax}% | Sell Tax: ${taxes.sellTax}%`,
     `Max TX: ${taxes.maxTxPercent.toFixed(1)}% of supply | Max Wallet: ${taxes.maxWalletPercent.toFixed(1)}%`,
     `${taxes.hasHighLimits ? "✅ Reasonable limits" : "⚠️ Restrictive limits"}`,
     "",
-    `<b>💧 LIQUIDITY</b>`,
+    `💧 LIQUIDITY`,
     lpDetails,
     `${liquidity.hasLiquidity ? "✅ Liquidity detected" : "❌ NO LIQUIDITY - CRITICAL"}`,
     `${liquidity.lpRiskLevel === "LOW" ? "🟢 LOW RISK" : liquidity.lpRiskLevel === "MEDIUM" ? "🟡 MEDIUM RISK" : "🔴 HIGH/CRITICAL RISK"} LP Protection`,
     "",
-    `<b>👥 HOLDER DISTRIBUTION</b>`,
+    `👥 HOLDER DISTRIBUTION`,
     `${holderAnalysis.totalLiveHolders || 0} live holders`,
-    `Top 10 control: <b>${holderAnalysis.top10Concentration.toFixed(1)}%</b>`,
+    `Top 10 control: ${holderAnalysis.top10Concentration.toFixed(1)}%`,
     `Gini Index: ${holderAnalysis.giniCoefficient} (0=equal, 1=unequal)`,
     `Distribution: ${holderAnalysis.healthyDistribution ? "✅ Healthy" : "⚠️ Concentrated"}`,
     "",
     holdersText,
     "",
-    `<b>🛡️ HONEYPOT CHECK</b>`,
-    `<i>${simulation.honeypotRisk}</i>`,
+    `🛡️ HONEYPOT CHECK`,
+    `${simulation.honeypotRisk}`,
     "",
-    `<b>📊 TRADING ACTIVITY (24h)</b>`,
+    `📊 TRADING ACTIVITY (24h)`,
     `${activity.devActivity}`,
     `Unique Buyers: ${activity.uniqueBuyers24h || 0}`,
     `Total Volume: ${activity.volume24h || '0'} tokens`,
@@ -1675,7 +1683,7 @@ function formatAnalysisReport(analysis) {
     `Buy:Sell Ratio: ${activity.buySellRatio}`,
     `${activity.hasHealthyActivity ? "✅ Active trading" : "⚠️ Low activity"}`,
     "",
-    `<b>🔒 SECURITY FEATURES</b>`,
+    `🔒 SECURITY FEATURES`,
     `Security Score: ${security.securityScore}/10`,
     `${security.hasDangerousFeatures ? "⚠️ Dangerous features detected" : "✅ No dangerous features"}`,
     security.features.mintable ? "🚨 Can mint new tokens" : "",
@@ -1683,15 +1691,15 @@ function formatAnalysisReport(analysis) {
     security.features.pauseable ? "🚨 Can pause trading" : "",
     `${security.features.ownershipRenounceable ? "✅ Can renounce ownership" : "⚠️ Cannot renounce ownership"}`,
     "",
-    `<b>💡 TRADER INSIGHTS</b>`,
+    `💡 TRADER INSIGHTS`,
     riskAssessment.insights,
     "",
-    `<b>⚠️ RISK SUMMARY</b>`,
-    `Overall Risk: <b>${riskAssessment.level}</b>`,
+    `⚠️ RISK SUMMARY`,
+    `Overall Risk: ${riskAssessment.level}`,
     `Risk Factors: ${riskAssessment.factors.length > 0 ? riskAssessment.factors.slice(0, 3).join(', ') : 'None detected'}${riskAssessment.factors.length > 3 ? '...' : ''}`,
     `Recommendation: ${getTradingRecommendation(riskAssessment.riskPercentage, liquidity.lpRiskLevel)}`,
     "",
-    `<i>⚠️ Always DYOR - This analysis is for informational purposes only</i>`
+    `⚠️ Always DYOR - This analysis is for informational purposes only`
   ].filter(line => line && line.trim() !== "").join("\n");
 }
 
