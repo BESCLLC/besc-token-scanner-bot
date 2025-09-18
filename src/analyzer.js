@@ -8,7 +8,7 @@ import { getTopHolders, detectDevSells } from "./holders.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ✅ Load ABIs safely (no assert required)
+// ✅ Load ABIs from files (works in all Node versions)
 const erc20Abi = JSON.parse(fs.readFileSync(path.join(__dirname, "abi", "ERC20.json"), "utf8"));
 const lpAbi = JSON.parse(fs.readFileSync(path.join(__dirname, "abi", "LP.json"), "utf8"));
 const lockerAbi = JSON.parse(fs.readFileSync(path.join(__dirname, "abi", "Locker.json"), "utf8"));
@@ -27,11 +27,11 @@ export async function analyzeToken(tokenAddress) {
     tryRead(() => token.owner())
   ]);
 
-  // Tax checks (if they exist)
+  // Tax checks (only works if token exposes them)
   const buyTax = await tryRead(() => token.buyTax?.());
   const sellTax = await tryRead(() => token.sellTax?.());
 
-  // Try to find LP pair
+  // Find LP pair from factory
   let lpAddress = null;
   try {
     const factory = new ethers.Contract(process.env.FACTORY_ADDRESS, [
@@ -66,7 +66,7 @@ export async function analyzeToken(tokenAddress) {
     lpBurnPercent = burnPercent;
   }
 
-  // Holders + Dev sell detection
+  // Top holders and dev sells
   const holders = await getTopHolders(tokenAddress, provider);
   const devSells = await detectDevSells(tokenAddress, provider);
 
@@ -94,6 +94,7 @@ async function analyzeLP(lpAddress) {
   try {
     const totalSupply = await lp.totalSupply();
 
+    // Check if LP is burned
     for (const addr of burnAddresses) {
       const bal = await lp.balanceOf(addr);
       if (bal > 0n) {
@@ -105,14 +106,29 @@ async function analyzeLP(lpAddress) {
     console.log("LP burn check failed:", err);
   }
 
-  // Locker check fallback
+  // Locker check (improved)
   try {
     const locker = new ethers.Contract(process.env.LOCKER_ADDRESS, lockerAbi, provider);
-    const events = await locker.queryFilter("Locked", 0, "latest");
-    const lock = events.find(e => e.args.token.toLowerCase() === lpAddress.toLowerCase());
-    if (lock) {
-      const unlockTime = new Date(Number(lock.args.unlockTime) * 1000);
-      return { status: `✅ Locked until <b>${unlockTime.toUTCString()}</b>`, burnPercent: 0 };
+    const events = await locker.queryFilter(locker.filters.Locked());
+    const relevantLocks = events.filter(
+      (e) => e.args.token.toLowerCase() === lpAddress.toLowerCase()
+    );
+
+    if (relevantLocks.length > 0) {
+      // Pick the one with the latest unlock time
+      const latestLock = relevantLocks.reduce((prev, curr) =>
+        Number(curr.args.unlockTime) > Number(prev.args.unlockTime) ? curr : prev
+      );
+
+      const unlockTime = new Date(Number(latestLock.args.unlockTime) * 1000);
+      const isUnlocked = latestLock.args.unlocked ?? false;
+
+      if (!isUnlocked) {
+        return {
+          status: `✅ Locked until <b>${unlockTime.toUTCString()}</b>`,
+          burnPercent: 0
+        };
+      }
     }
   } catch (err) {
     console.log("Locker query failed:", err);
@@ -121,8 +137,19 @@ async function analyzeLP(lpAddress) {
   return { status: "⚠️ LP Not Locked or Burned", burnPercent: 0 };
 }
 
-function formatReport({ name, symbol, totalSupply, owner, buyTax, sellTax, lpInfo, lpBurnPercent, holders, devSells }) {
-  // Determine risk rating
+function formatReport({
+  name,
+  symbol,
+  totalSupply,
+  owner,
+  buyTax,
+  sellTax,
+  lpInfo,
+  lpBurnPercent,
+  holders,
+  devSells
+}) {
+  // Risk calculation
   let riskLevel = "🟢 SAFE";
   if (lpInfo.includes("⚠️") || (holders[0]?.percent ?? 0) > 50 || devSells.length > 0) {
     riskLevel = "🔴 DANGER";
@@ -132,7 +159,9 @@ function formatReport({ name, symbol, totalSupply, owner, buyTax, sellTax, lpInf
 
   const topHolders =
     holders.length > 0
-      ? holders.map((h) => `• <code>${h.address}</code> (${h.percent.toFixed(2)}%)`).join("\n")
+      ? holders
+          .map((h) => `• <code>${h.address}</code> (${h.percent.toFixed(2)}%)`)
+          .join("\n")
       : "N/A";
 
   const devSellNote =
