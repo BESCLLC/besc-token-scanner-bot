@@ -930,8 +930,8 @@ async function checkLockerStatus(lpPair, totalLPSupply) {
     
     const lockerContract = new ethers.Contract(LOCKER_ADDRESS, LOCKER_ABI, provider);
     
-    // 🔥 FIXED: Query Locked events filtered by token = lpPair
-    const filter = lockerContract.filters.Locked(null, null, lpPair);
+    // 🔥 FIXED: Query Locked events filtered by token = lpPair (correct parameter position: 4th arg for indexed token)
+    const filter = lockerContract.filters.Locked(null, null, null, lpPair, null, null);
     const lockedEvents = await lockerContract.queryFilter(filter, 0, "latest");
     
     console.log(`Found ${lockedEvents.length} Locked events for LP ${lpPair}`);
