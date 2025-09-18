@@ -1,4 +1,5 @@
 import { ethers } from "ethers";
+import { bnToDecimal } from "./utils.js";
 
 export async function getTopHolders(token, provider) {
   try {
@@ -15,15 +16,19 @@ export async function getTopHolders(token, provider) {
 
     if (!logs.length) return [];
 
-    // Collect unique addresses from recent logs
+    // Collect unique addresses from logs
     const uniqueAddresses = new Set();
+    const iface = new ethers.Interface([
+      "event Transfer(address indexed from, address indexed to, uint256 value)"
+    ]);
+
     for (const log of logs) {
-      const { args } = decodeTransfer(log);
+      const { args } = iface.parseLog(log);
       if (args.from !== ethers.ZeroAddress) uniqueAddresses.add(args.from);
       if (args.to !== ethers.ZeroAddress) uniqueAddresses.add(args.to);
     }
 
-    // Now query actual balances on-chain
+    // Get actual balances on-chain
     const tokenContract = new ethers.Contract(
       token,
       [
@@ -37,19 +42,21 @@ export async function getTopHolders(token, provider) {
     const holders = [];
 
     for (const addr of uniqueAddresses) {
-      const bal = await tokenContract.balanceOf(addr);
+      let bal = 0n;
+      try {
+        bal = await tokenContract.balanceOf(addr);
+      } catch {}
       if (bal > 0n) {
         holders.push({ address: addr, balance: bal });
       }
     }
 
-    // Sort by balance desc
     holders.sort((a, b) => (b.balance > a.balance ? 1 : -1));
 
-    // Take top 5 and compute percentages
+    // Calculate percentages
     return holders.slice(0, 5).map((h) => ({
       address: h.address,
-      percent: Number((h.balance * 10000n) / totalSupply) / 100
+      percent: Number((h.balance * 10000n) / (totalSupply || 1n)) / 100
     }));
   } catch (e) {
     console.error("Error in getTopHolders:", e);
@@ -70,19 +77,65 @@ export async function detectDevSells(token, provider) {
       topics: [transferTopic]
     });
 
-    return logs.filter((log) => {
-      const { args } = decodeTransfer(log);
-      return args.from !== ethers.ZeroAddress;
-    });
+    if (!logs.length) return [];
+
+    const iface = new ethers.Interface([
+      "event Transfer(address indexed from, address indexed to, uint256 value)"
+    ]);
+    const transfers = logs.map((l) => iface.parseLog(l).args);
+
+    // Identify likely dev wallets: owner() + top 3 senders in this window
+    const tokenContract = new ethers.Contract(
+      token,
+      ["function owner() view returns (address)"],
+      provider
+    );
+
+    let ownerAddress = null;
+    try {
+      ownerAddress = await tokenContract.owner();
+    } catch {
+      ownerAddress = null; // token has no owner() function
+    }
+
+    const senderCounts = {};
+    for (const t of transfers) {
+      senderCounts[t.from] = (senderCounts[t.from] || 0n) + t.value;
+    }
+
+    const topSenders = Object.entries(senderCounts)
+      .sort((a, b) => (b[1] > a[1] ? 1 : -1))
+      .slice(0, 3)
+      .map(([addr]) => addr);
+
+    const likelyDevWallets = new Set([
+      ...(ownerAddress ? [ethers.getAddress(ownerAddress)] : []),
+      ...topSenders
+    ].map(a => ethers.getAddress(a)));
+
+    const suspectedSells = [];
+
+    for (const t of transfers) {
+      if (!likelyDevWallets.has(ethers.getAddress(t.from))) continue;
+
+      // optional: filter for sells to LP pairs / known routers
+      // You can add known router addresses to this list to avoid false positives
+      const isSell =
+        t.to !== ethers.ZeroAddress &&
+        t.value > 0n;
+
+      if (isSell) {
+        suspectedSells.push({
+          from: t.from,
+          to: t.to,
+          value: t.value
+        });
+      }
+    }
+
+    return suspectedSells;
   } catch (e) {
     console.error("Error in detectDevSells:", e);
     return [];
   }
-}
-
-function decodeTransfer(log) {
-  const iface = new ethers.Interface([
-    "event Transfer(address indexed from, address indexed to, uint256 value)"
-  ]);
-  return iface.parseLog(log);
 }
