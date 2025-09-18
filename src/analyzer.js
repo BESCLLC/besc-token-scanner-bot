@@ -105,11 +105,13 @@ export async function analyzeToken(tokenAddress) {
       tokenInfo.totalSupply,
       tokenInfo.decimals
     );
-    let holdersText = holders.length
-      ? holders.map((h) => `• ${h.label || `<code>${h.address}</code>`} (${h.percent.toFixed(2)}%)`).join("\n")
+
+    // Display only top 7 holders but keep full list for risk + top 10 %
+    const topHoldersDisplay = holders.slice(0, 7);
+    let holdersText = topHoldersDisplay.length
+      ? topHoldersDisplay.map((h) => `• ${h.label || `<code>${h.address}</code>`} (${h.percent.toFixed(2)}%)`).join("\n")
       : "No holder data found.";
 
-    // 🔥 NEW: Show total concentration of top holders
     if (holders.length > 0) {
       const top10Percent = holders.slice(0, 10).reduce((sum, h) => sum + h.percent, 0);
       holdersText += `\n\n<b>Top 10 Holders Own:</b> ${top10Percent.toFixed(2)}% of Supply`;
@@ -135,20 +137,33 @@ export async function analyzeToken(tokenAddress) {
       }
     }
 
-    // --- 7. Honeypot Simulation ---
+    // --- 7. Honeypot Simulation (Improved) ---
     let honeypotRisk = "✅ Sell transactions simulated successfully";
     try {
-      // pick a random address to simulate
       const testWallet = ethers.Wallet.createRandom().address;
+      // Small amount test
       await provider.call({
         to: tokenAddress,
         data: tokenContract.interface.encodeFunctionData("transfer", [
           testWallet,
-          1n // send 1 token unit
+          1n
         ])
       });
-    } catch (err) {
-      honeypotRisk = "🛑 Possible Honeypot — Sell transfer simulation failed!";
+    } catch {
+      // Retry with a normal amount if small transfer fails
+      try {
+        const normalAmount = ethers.parseUnits("1", tokenInfo.decimals);
+        await provider.call({
+          to: tokenAddress,
+          data: tokenContract.interface.encodeFunctionData("transfer", [
+            ethers.Wallet.createRandom().address,
+            normalAmount
+          ])
+        });
+        honeypotRisk = "ℹ️ Dust trades blocked — normal sells pass ✅";
+      } catch {
+        honeypotRisk = "🛑 Possible Honeypot — Sell transfer simulation failed!";
+      }
     }
 
     // --- 8. Risk Assessment ---
