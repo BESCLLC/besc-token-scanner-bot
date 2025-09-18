@@ -133,14 +133,118 @@ const ENHANCED_TOKEN_ABI = [
   "function burn(uint256) external"
 ];
 
+// 🔥 FIXED: Proper Blockscout token info fetcher with correct API parameters
+async function fetchTokenInfoFromBlockscout(tokenAddress) {
+  try {
+    console.log(`🔍 Fetching token info from Blockscout: ${tokenAddress}`);
+    
+    // ✅ FIXED: Use correct Blockscout API parameters (module and action)
+    const response = await axios.get(`${BASE_URL}`, {
+      params: {
+        module: "token",
+        action: "tokeninfo",
+        contractaddress: tokenAddress
+      },
+      timeout: 10000
+    });
+
+    if (response.data.status === "1" && response.data.result) {
+      const tokenData = response.data.result;
+      
+      // ✅ Extract real total supply from Blockscout
+      let totalSupply = tokenData.total_supply || "0";
+      
+      // Handle different supply formats from Blockscout
+      if (typeof totalSupply === 'string') {
+        // Remove commas and try to parse
+        totalSupply = totalSupply.replace(/,/g, '');
+        if (!isNaN(totalSupply) && totalSupply !== "0") {
+          totalSupply = totalSupply;
+        } else {
+          totalSupply = "0";
+        }
+      }
+
+      // Fallback: Try to get supply via contract call if Blockscout doesn't provide it
+      if (totalSupply === "0" || !totalSupply) {
+        try {
+          const tokenContract = new ethers.Contract(tokenAddress, ["function totalSupply() view returns (uint256)"], provider);
+          totalSupply = await tokenContract.totalSupply();
+          console.log(`✅ Fetched supply via contract call: ${totalSupply}`);
+        } catch (contractError) {
+          console.log("Contract supply call failed:", contractError.message);
+          totalSupply = "0";
+        }
+      }
+
+      return {
+        name: tokenData.name || "Unknown",
+        symbol: tokenData.symbol || "???", 
+        decimals: parseInt(tokenData.decimals) || 18,
+        totalSupply: BigInt(totalSupply || 0),
+        verified: true,
+        blockscoutData: tokenData
+      };
+    } else {
+      console.log("Blockscout token info failed, trying contract fallback");
+      // Fallback to contract calls
+      return await fetchTokenInfoFromContract(tokenAddress);
+    }
+  } catch (err) {
+    console.log("Blockscout API error:", err.message);
+    console.log("Trying contract fallback...");
+    return await fetchTokenInfoFromContract(tokenAddress);
+  }
+}
+
+// Fallback: Get token info directly from contract calls
+async function fetchTokenInfoFromContract(tokenAddress) {
+  try {
+    const tokenContract = new ethers.Contract(tokenAddress, [
+      "function name() view returns (string)",
+      "function symbol() view returns (string)", 
+      "function decimals() view returns (uint8)",
+      "function totalSupply() view returns (uint256)"
+    ], provider);
+
+    const [name, symbol, decimals, totalSupply] = await Promise.all([
+      tokenContract.name().catch(() => "Unknown"),
+      tokenContract.symbol().catch(() => "???"),
+      tokenContract.decimals().catch(() => 18),
+      tokenContract.totalSupply().catch(() => 0n)
+    ]);
+
+    console.log(`✅ Fetched from contract: ${name} (${symbol}), Supply: ${totalSupply}, Decimals: ${decimals}`);
+    
+    return {
+      name,
+      symbol,
+      decimals,
+      totalSupply,
+      verified: false
+    };
+  } catch (err) {
+    console.log("Contract info fetch failed:", err.message);
+    return {
+      name: "Unknown",
+      symbol: "???",
+      decimals: 18,
+      totalSupply: 0n,
+      verified: false
+    };
+  }
+}
+
 export async function analyzeToken(tokenAddress) {
   try {
     console.log(`🔍 Analyzing token: ${tokenAddress}`);
     
-    // --- 1. Get Enhanced Token Info with FIXED supply ---
-    const tokenInfo = await getTokenInfo(tokenAddress);
+    // --- 1. Get Enhanced Token Info with FIXED Blockscout supply ---
+    const tokenInfo = await fetchTokenInfoFromBlockscout(tokenAddress); // 🔥 FIXED: Use our new proper fetcher
+    console.log(`Token info loaded: ${tokenInfo.name} (${tokenInfo.symbol}), Supply: ${tokenInfo.totalSupply}`);
+    
     const contractAnalysis = await analyzeContractFeatures(tokenAddress);
-    const verified = await checkContractVerified(tokenAddress);
+    const verified = tokenInfo.verified || await checkContractVerified(tokenAddress);
     const holderAnalysis = await analyzeHolderDistribution(tokenAddress, tokenInfo);
     const pairCreationInfo = await getPairCreationInfo(tokenAddress);
 
@@ -152,7 +256,7 @@ export async function analyzeToken(tokenAddress) {
     ownership.verified = verified;
 
     // --- 4. Tax Analysis with Max Limits ---
-    const taxes = await analyzeTaxes(tokenContract);
+    const taxes = await analyzeTaxes(tokenContract, tokenInfo.totalSupply); // Pass supply for accurate %
 
     // --- 5. Liquidity & LP Analysis with FIXED risk ---
     const liquidity = await analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo);
@@ -175,7 +279,8 @@ export async function analyzeToken(tokenAddress) {
       simulation,
       activity,
       security,
-      contractAnalysis
+      contractAnalysis,
+      tokenInfo // Pass tokenInfo for better risk calculation
     });
 
     return formatAnalysisReport({
@@ -328,8 +433,8 @@ async function analyzeOwnership(tokenContract, tokenAddress) {
   };
 }
 
-// Enhanced tax analysis
-async function analyzeTaxes(tokenContract) {
+// 🔥 FIXED: Enhanced tax analysis with proper supply handling
+async function analyzeTaxes(tokenContract, totalSupply) {
   const taxFunctions = {
     buy: ["liquidityFee", "marketingFee", "rewardsFee", "teamFee", "tax", "buyTax"],
     sell: ["liquidityFeeSell", "marketingFeeSell", "rewardsFeeSell", "teamFeeSell", "sellTax"],
@@ -359,37 +464,31 @@ async function analyzeTaxes(tokenContract) {
     } catch {}
   }
 
-  // Check max transaction limits
-  try {
-    const totalSupply = await tokenContract.totalSupply();
-    if (totalSupply > 0n) {
-      for (const fn of taxFunctions.maxTx) {
-        try {
-          const maxTx = await tokenContract[fn]();
-          if (maxTx && maxTx > 0n && maxTx < totalSupply) {
-            maxTxPercent = Number((maxTx * 100n) / totalSupply);
-            break;
-          }
-        } catch {}
-      }
+  // 🔥 FIXED: Check max transaction limits with proper supply
+  if (totalSupply && totalSupply > 0n) {
+    for (const fn of taxFunctions.maxTx) {
+      try {
+        const maxTx = await tokenContract[fn]();
+        if (maxTx && maxTx > 0n && maxTx < totalSupply) {
+          maxTxPercent = Number((maxTx * 100n) / totalSupply);
+          break;
+        }
+      } catch {}
     }
-  } catch {}
+  }
 
-  // Check max wallet limits
-  try {
-    const totalSupply = await tokenContract.totalSupply();
-    if (totalSupply > 0n) {
-      for (const fn of taxFunctions.maxWallet) {
-        try {
-          const maxWallet = await tokenContract[fn]();
-          if (maxWallet && maxWallet > 0n && maxWallet < totalSupply) {
-            maxWalletPercent = Number((maxWallet * 100n) / totalSupply);
-            break;
-          }
-        } catch {}
-      }
+  // 🔥 FIXED: Check max wallet limits with proper supply
+  if (totalSupply && totalSupply > 0n) {
+    for (const fn of taxFunctions.maxWallet) {
+      try {
+        const maxWallet = await tokenContract[fn]();
+        if (maxWallet && maxWallet > 0n && maxWallet < totalSupply) {
+          maxWalletPercent = Number((maxWallet * 100n) / totalSupply);
+          break;
+        }
+      } catch {}
     }
-  } catch {}
+  }
 
   return {
     buyTax: Math.min(buyTax, 100), // Cap at 100%
@@ -642,8 +741,13 @@ async function findLiquidityPair(tokenAddress) {
 async function findPairViaExplorer(tokenAddress) {
   try {
     // Use Blockscout API to find transactions involving the token that might be pair creation
-    const response = await axios.get(`${BASE_URL}/addresses/${tokenAddress}/transactions`, {
-      params: { limit: 10 },
+    const response = await axios.get(`${BASE_URL}`, {
+      params: {
+        module: "account",
+        action: "txlist",
+        address: tokenAddress,
+        limit: 10
+      },
       timeout: 5000
     });
     
@@ -1067,14 +1171,21 @@ function calculateGiniCoefficient(holders) {
 // Fixed contract verification using correct API endpoint
 async function checkContractVerified(address) {
   try {
-    const response = await axios.get(`${BASE_URL}/smart-contracts/${address}`, {
+    const response = await axios.get(`${BASE_URL}`, {
+      params: {
+        module: "contract",
+        action: "getsourcecode",
+        address: address
+      },
       timeout: 5000
     });
     
     return response.data && 
-           response.data.compiler_version && 
-           response.data.name !== null &&
-           response.status === 200;
+           response.data.status === "1" && 
+           response.data.result &&
+           response.data.result[0] &&
+           response.data.result[0].SourceCode !== "" &&
+           response.data.result[0].ABI !== "Contract source code not verified";
   } catch (err) {
     console.log(`Contract verification failed for ${address}:`, err.message);
     return false;
@@ -1258,7 +1369,7 @@ function generateTraderInsights(analysis, riskPercentage) {
   return insights.length > 0 ? insights.join("\n") : "⚠️ No specific insights - CRITICAL: DYOR immediately";
 }
 
-// FIXED: Enhanced report formatting with real supply data and proper LP warnings
+// 🔥 FIXED: Enhanced report formatting with REAL supply data from Blockscout
 function formatAnalysisReport(analysis) {
   const { riskAssessment, tokenInfo, ownership, taxes, liquidity, holderAnalysis, 
           simulation, activity, security, contractAnalysis, pairCreationInfo } = analysis;
@@ -1286,22 +1397,29 @@ function formatAnalysisReport(analysis) {
     lpDetails += `\n   └─ Unlocks: ${liquidity.unlockDate}`;
   }
 
-  // FIXED: Format total supply properly
+  // 🔥 FIXED: Format total supply properly from Blockscout/contract
   let formattedSupply = "Unknown";
-  if (tokenInfo.totalSupply && tokenInfo.decimals) {
+  if (tokenInfo.totalSupply && tokenInfo.totalSupply > 0n) {
     try {
-      formattedSupply = ethers.formatUnits(tokenInfo.totalSupply, tokenInfo.decimals);
-      // Format large numbers nicely
-      if (parseFloat(formattedSupply) > 1000000) {
-        formattedSupply = (parseFloat(formattedSupply) / 1000000).toFixed(2) + "M";
-      } else if (parseFloat(formattedSupply) > 1000) {
-        formattedSupply = (parseFloat(formattedSupply) / 1000).toFixed(2) + "K";
+      const supplyNumber = Number(ethers.formatUnits(tokenInfo.totalSupply, tokenInfo.decimals));
+      if (supplyNumber >= 1000000) {
+        formattedSupply = (supplyNumber / 1000000).toFixed(1) + "M";
+      } else if (supplyNumber >= 1000) {
+        formattedSupply = (supplyNumber / 1000).toFixed(0) + "K";
+      } else {
+        formattedSupply = supplyNumber.toLocaleString();
       }
+      
+      // For very small supplies, show full precision
+      if (supplyNumber < 1) {
+        formattedSupply = ethers.formatUnits(tokenInfo.totalSupply, tokenInfo.decimals);
+      }
+      
+      console.log(`✅ Formatted supply: ${formattedSupply} (raw: ${tokenInfo.totalSupply})`);
     } catch (e) {
+      console.log("Supply formatting error:", e.message);
       formattedSupply = tokenInfo.totalSupply.toString();
     }
-  } else if (tokenInfo.totalSupply) {
-    formattedSupply = tokenInfo.totalSupply.toString();
   }
 
   return [
@@ -1309,7 +1427,7 @@ function formatAnalysisReport(analysis) {
     "",
     `<b>📋 TOKEN OVERVIEW</b>`,
     `<code>${tokenInfo.name || 'Unknown'}</code> (<code>${tokenInfo.symbol || '???'}</code>)`,
-    `Total Supply: <code>${formattedSupply}</code>`, // FIXED: Proper supply formatting
+    `Total Supply: <code>${formattedSupply}</code>`, // 🔥 FIXED: Now shows REAL supply
     `Contract Age: ${contractAge}`,
     `Contract: ${contractAnalysis.isContract ? "✅ Deployed" : "❌ Not a contract"}`,
     `Verified: ${ownership.verified ? "✅ Verified Source Code" : "⚠️ Unverified"}`,
