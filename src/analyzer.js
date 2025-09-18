@@ -6,7 +6,7 @@ import { createRequire } from "module";
 const require = createRequire(import.meta.url);
 const lpAbi = require("./abi/LP.json");
 
-// Updated locker ABI based on your provided contract
+// Updated locker ABI based on your provided contract - Added Locked event
 const LOCKER_ABI = [
   {
     "inputs": [
@@ -84,6 +84,50 @@ const LOCKER_ABI = [
     ],
     "stateMutability": "view",
     "type": "function"
+  },
+  // 🔥 ADDED: Locked event for querying
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "user",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "amount",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "unlockTime",
+        "type": "uint256"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "token",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "string",
+        "name": "purpose",
+        "type": "string"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "lockId",
+        "type": "uint256"
+      }
+    ],
+    "name": "Locked",
+    "type": "event"
   }
 ];
 
@@ -875,42 +919,55 @@ async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo) {
   };
 }
 
-// 🔥 FIXED: Real locker status checking - Use locker owner as user for getUserLocks, then filter by LP token
+// 🔥 FIXED: Event-based locker status checking to find all locks for the LP token
 async function checkLockerStatus(lpPair, totalLPSupply) {
   try {
     if (!LOCKER_ADDRESS) {
       return { locked: false, lockedAmount: 0n, lockedPercent: 0, unlockTime: 0, unlockDate: "N/A" };
     }
 
-    console.log(`🔍 Checking locker status for LP: ${lpPair}`);
+    console.log(`🔍 Checking locker status for LP: ${lpPair} via events`);
     
     const lockerContract = new ethers.Contract(LOCKER_ADDRESS, LOCKER_ABI, provider);
     
-    // 🔥 FIXED: Get locks from the locker owner (likely the deployer who locked the LP)
-    const lockerOwner = await lockerContract.owner().catch(() => ethers.ZeroAddress);
-    console.log(`Locker owner: ${lockerOwner}`);
+    // 🔥 FIXED: Query Locked events filtered by token = lpPair
+    const filter = lockerContract.filters.Locked(null, null, lpPair);
+    const lockedEvents = await lockerContract.queryFilter(filter, 0, "latest");
     
-    if (lockerOwner === ethers.ZeroAddress) {
-      console.log("Could not fetch locker owner, skipping lock check");
-      return { locked: false, lockedAmount: 0n, lockedPercent: 0, unlockTime: 0, unlockDate: "N/A" };
-    }
-    
-    const userLocks = await lockerContract.getUserLocks(lockerOwner);
-    
-    console.log(`Found ${userLocks.length} locks for locker owner ${lockerOwner}`);
+    console.log(`Found ${lockedEvents.length} Locked events for LP ${lpPair}`);
 
     let totalLockedAmount = 0n;
     let earliestUnlockTime = 0;
     let hasActiveLocks = false;
 
-    for (const lock of userLocks) {
-      if (!lock.unlocked && lock.token.toLowerCase() === lpPair.toLowerCase()) {
-        hasActiveLocks = true;
-        totalLockedAmount += lock.amount;
+    // Get current timestamp
+    const latestBlock = await provider.getBlockNumber();
+    const currentTimestamp = (await provider.getBlock(latestBlock)).timestamp;
+
+    // Process each event
+    for (const event of lockedEvents) {
+      const user = event.args.user;
+      const lockId = Number(event.args.lockId);
+
+      try {
+        // Fetch user's locks to check current status
+        const userLocks = await lockerContract.getUserLocks(user);
         
-        if (earliestUnlockTime === 0 || lock.unlockTime < earliestUnlockTime) {
-          earliestUnlockTime = Number(lock.unlockTime);
+        if (lockId < userLocks.length) {
+          const lock = userLocks[lockId];
+          if (!lock.unlocked && lock.token.toLowerCase() === lpPair.toLowerCase() && currentTimestamp < lock.unlockTime) {
+            hasActiveLocks = true;
+            totalLockedAmount += lock.amount;
+            
+            if (earliestUnlockTime === 0 || lock.unlockTime < earliestUnlockTime) {
+              earliestUnlockTime = Number(lock.unlockTime);
+            }
+            
+            console.log(`Active lock found: User ${user}, ID ${lockId}, Amount ${ethers.formatEther(lock.amount)}, Unlock ${new Date(lock.unlockTime * 1000).toLocaleDateString()}`);
+          }
         }
+      } catch (userErr) {
+        console.log(`Failed to fetch locks for user ${user}:`, userErr.message);
       }
     }
 
@@ -918,16 +975,19 @@ async function checkLockerStatus(lpPair, totalLPSupply) {
       const lockedPercent = Number((totalLockedAmount * 10000n) / totalLPSupply) / 100;
       const unlockDate = new Date(earliestUnlockTime * 1000).toLocaleDateString();
       
+      console.log(`✅ Detected locked LP: ${lockedPercent.toFixed(2)}% until ${unlockDate}`);
+      
       return {
         locked: true,
         lockedAmount: totalLockedAmount,
         lockedPercent: Math.min(lockedPercent, 100),
         unlockTime: earliestUnlockTime,
         unlockDate: unlockDate,
-        lockCount: userLocks.filter(l => !l.unlocked && l.token.toLowerCase() === lpPair.toLowerCase()).length
+        lockCount: lockedEvents.length // Approximate, but events include all historical
       };
     }
 
+    console.log("No active locks found for this LP");
     return { 
       locked: false, 
       lockedAmount: 0n, 
