@@ -137,7 +137,7 @@ export async function analyzeToken(tokenAddress) {
   try {
     console.log(`🔍 Analyzing token: ${tokenAddress}`);
     
-    // --- 1. Get Enhanced Token Info ---
+    // --- 1. Get Enhanced Token Info with FIXED supply ---
     const tokenInfo = await getTokenInfo(tokenAddress);
     const contractAnalysis = await analyzeContractFeatures(tokenAddress);
     const verified = await checkContractVerified(tokenAddress);
@@ -154,7 +154,7 @@ export async function analyzeToken(tokenAddress) {
     // --- 4. Tax Analysis with Max Limits ---
     const taxes = await analyzeTaxes(tokenContract);
 
-    // --- 5. Liquidity & LP Analysis ---
+    // --- 5. Liquidity & LP Analysis with FIXED risk ---
     const liquidity = await analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo);
 
     // --- 6. Honeypot & Simulation ---
@@ -166,7 +166,7 @@ export async function analyzeToken(tokenAddress) {
     // --- 8. Security Analysis ---
     const security = await analyzeSecurityFeatures(tokenAddress);
 
-    // --- 9. Calculate Comprehensive Risk ---
+    // --- 9. Calculate Comprehensive Risk with FIXED LP weighting ---
     const riskAssessment = calculateComprehensiveRisk({
       taxes,
       liquidity,
@@ -400,7 +400,7 @@ async function analyzeTaxes(tokenContract) {
   };
 }
 
-// Enhanced liquidity analysis with REAL locker checking
+// FIXED: Enhanced liquidity analysis with REAL locker checking and proper risk
 async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo) {
   let lpStatus = "⚠️ No LP found";
   let lpPercentBurned = 0;
@@ -413,6 +413,7 @@ async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo) {
   let lockedPercent = 0;
   let unlockTime = 0;
   let unlockDate = "N/A";
+  let lpRiskLevel = "HIGH"; // Default to high risk
 
   try {
     lpPair = await findLiquidityPair(tokenAddress);
@@ -456,27 +457,42 @@ async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo) {
           
           if (lockedPercent >= 51) {
             lpStatus = `🔒 LP LOCKED: ${lockedPercent.toFixed(1)}% until ${unlockDate}`;
-          } else {
+            lpRiskLevel = "LOW";
+          } else if (lockedPercent >= 25) {
             lpStatus = `🔒 LP PARTIALLY LOCKED: ${lockedPercent.toFixed(1)}% until ${unlockDate}`;
+            lpRiskLevel = "MEDIUM";
+          } else {
+            lpStatus = `🔒 LP MINIMALLY LOCKED: ${lockedPercent.toFixed(1)}% until ${unlockDate} (INSUFFICIENT)`;
+            lpRiskLevel = "HIGH";
           }
         } else if (lpPercentBurned >= 51) {
           lpStatus = `🔥 LP BURNED: ${lpPercentBurned.toFixed(1)}%`;
-        } else if (lpPercentBurned > 0) {
-          lpStatus = `⚠️ LP PARTIALLY BURNED: ${lpPercentBurned.toFixed(1)}%`;
+          lpRiskLevel = "LOW";
+        } else if (lpPercentBurned >= 25) {
+          lpStatus = `⚠️ LP PARTIALLY BURNED: ${lpPercentBurned.toFixed(1)}% (INSUFFICIENT)`;
+          lpRiskLevel = "MEDIUM";
         } else {
-          lpStatus = `⚠️ LP UNLOCKED - Liquidity can be removed`;
+          lpStatus = `🚨 LP UNLOCKED & UNBURNED - HIGH RUG PULL RISK`;
+          lpRiskLevel = "CRITICAL";
         }
       } else if (lpPercentBurned >= 51) {
         lpStatus = `🔥 LP BURNED: ${lpPercentBurned.toFixed(1)}%`;
-      } else if (lpPercentBurned > 0) {
-        lpStatus = `⚠️ LP PARTIALLY BURNED: ${lpPercentBurned.toFixed(1)}%`;
+        lpRiskLevel = "LOW";
+      } else if (lpPercentBurned >= 25) {
+        lpStatus = `⚠️ LP PARTIALLY BURNED: ${lpPercentBurned.toFixed(1)}% (INSUFFICIENT)`;
+        lpRiskLevel = "MEDIUM";
       } else {
-        lpStatus = `⚠️ LP UNLOCKED - Liquidity can be removed`;
+        lpStatus = `🚨 LP UNLOCKED & UNBURNED - HIGH RUG PULL RISK`;
+        lpRiskLevel = "CRITICAL";
       }
+    } else {
+      lpStatus = `❌ NO LIQUIDITY FOUND - CRITICAL RISK`;
+      lpRiskLevel = "CRITICAL";
     }
   } catch (err) {
     console.log("Liquidity analysis failed:", err.message);
-    lpStatus = `❌ Liquidity check failed: ${err.message}`;
+    lpStatus = `❌ Liquidity check failed: ${err.message} - CRITICAL RISK`;
+    lpRiskLevel = "CRITICAL";
   }
 
   return {
@@ -490,7 +506,8 @@ async function analyzeLiquidity(tokenAddress, tokenInfo, pairCreationInfo) {
     lockedAmount,
     lockedPercent,
     unlockTime,
-    unlockDate
+    unlockDate,
+    lpRiskLevel // NEW: Explicit risk level for LP
   };
 }
 
@@ -1064,82 +1081,88 @@ async function checkContractVerified(address) {
   }
 }
 
-// Comprehensive risk calculation
+// FIXED: Comprehensive risk calculation with PROPER LP weighting
 function calculateComprehensiveRisk(analysis) {
   let score = 0;
   const factors = [];
 
-  // Ownership risk (20 points max)
-  if (analysis.ownership.ownershipRisk === "High") score += 15;
-  else if (analysis.ownership.ownershipRisk === "Medium") score += 8;
+  // Ownership risk (15 points max)
+  if (analysis.ownership.ownershipRisk === "High") score += 12;
+  else if (analysis.ownership.ownershipRisk === "Medium") score += 6;
 
-  // Tax risk (25 points max)
-  if (analysis.taxes.buyTax > 15 || analysis.taxes.sellTax > 15) score += 20;
-  else if (analysis.taxes.buyTax > 10 || analysis.taxes.sellTax > 10) score += 12;
+  // Tax risk (20 points max)
+  if (analysis.taxes.buyTax > 15 || analysis.taxes.sellTax > 15) score += 16;
+  else if (analysis.taxes.buyTax > 10 || analysis.taxes.sellTax > 10) score += 10;
   
-  if (!analysis.taxes.hasHighLimits) score += 8;
+  if (!analysis.taxes.hasHighLimits) score += 6;
 
-  // Liquidity risk (20 points max) - Updated with real locker data
+  // FIXED: Liquidity risk (30 points max) - MUCH MORE WEIGHT GIVEN
   if (!analysis.liquidity.hasLiquidity) {
+    score += 30;
+    factors.push("🚨 NO LIQUIDITY - CRITICAL RISK");
+  } else if (analysis.liquidity.lpRiskLevel === "CRITICAL") {
+    score += 25;
+    factors.push("🚨 LP UNLOCKED & UNBURNED - EXTREME RUG PULL RISK");
+  } else if (analysis.liquidity.lpRiskLevel === "HIGH") {
     score += 20;
-    factors.push("No liquidity detected");
-  } else if (!analysis.liquidity.lpLocked && analysis.liquidity.lpPercentBurned < 25) {
-    score += 15;
-    factors.push("Low liquidity protection");
-  } else if (!analysis.liquidity.lpLocked && analysis.liquidity.lpPercentBurned < 51) {
-    score += 8;
-    factors.push("Partial liquidity protection");
+    factors.push("🔴 INSUFFICIENT LP PROTECTION - HIGH RUG RISK");
+  } else if (analysis.liquidity.lpRiskLevel === "MEDIUM") {
+    score += 12;
+    factors.push("🟡 PARTIAL LP PROTECTION - MODERATE RUG RISK");
+  } else if (analysis.liquidity.lpRiskLevel === "LOW") {
+    score += 0;
+    factors.push("✅ STRONG LP PROTECTION - LOW RUG RISK");
   }
 
   // Holder concentration risk (15 points max)
   if (analysis.holderAnalysis.top10Concentration > 60) {
     score += 15;
-    factors.push("Extreme holder concentration");
+    factors.push("🐋 EXTREME WHALE CONCENTRATION");
   } else if (analysis.holderAnalysis.top10Concentration > 40) {
     score += 8;
-    factors.push("High holder concentration");
+    factors.push("🐋 HIGH WHALE CONCENTRATION");
   }
 
-  // Honeypot risk (15 points max)
+  // Honeypot risk (10 points max)
   if (analysis.simulation.honeypotRisk.includes("HIGH")) {
-    score += 15;
-    factors.push("High honeypot risk");
+    score += 10;
+    factors.push("🛑 HIGH HONEYPOT RISK");
   } else if (analysis.simulation.honeypotRisk.includes("POTENTIAL") || analysis.simulation.honeypotRisk.includes("MODERATE")) {
-    score += 8;
-    factors.push("Potential honeypot risk");
+    score += 5;
+    factors.push("⚠️ POTENTIAL HONEYPOT CONCERNS");
   }
 
   // Security features risk (10 points max)
   if (analysis.security.hasDangerousFeatures) {
     score += 8;
-    factors.push("Dangerous contract features");
+    factors.push("🚨 DANGEROUS CONTRACT FEATURES");
   }
   if (analysis.security.securityScore < 5) score += 2;
 
   // Activity risk (5 points max)
   if (!analysis.activity.hasHealthyActivity) {
     score += 3;
-    factors.push("Low trading activity");
+    factors.push("📉 LOW TRADING ACTIVITY");
   }
   if (analysis.activity.devActivity.includes("🚨")) {
     score += 2;
-    factors.push("Suspicious dev activity");
+    factors.push("🚨 SUSPICIOUS DEV ACTIVITY");
   }
 
   // Contract complexity (5 points max)
   if (analysis.contractAnalysis.complexityScore > 7) score += 3;
   if (analysis.contractAnalysis.suspiciousPatterns.canMint) score += 2;
 
-  const maxScore = 115;
+  const maxScore = 110;
   const riskPercentage = Math.round((score / maxScore) * 100);
   
-  // Determine risk level
+  // FIXED: Determine risk level with proper LP consideration
   let level, emoji, color;
-  if (riskPercentage >= 60) {
+  if (riskPercentage >= 50 || analysis.liquidity.lpRiskLevel === "CRITICAL") {
     level = "HIGH RISK";
     emoji = "🔴";
     color = "danger";
-  } else if (riskPercentage >= 35) {
+  } else if (riskPercentage >= 30 || analysis.liquidity.lpRiskLevel === "HIGH") {
     level = "MEDIUM RISK";
     emoji = "🟡";
     color = "warning";
@@ -1165,6 +1188,15 @@ function calculateComprehensiveRisk(analysis) {
 
 function generateTraderInsights(analysis, riskPercentage) {
   const insights = [];
+  
+  // CRITICAL WARNINGS FIRST
+  if (analysis.liquidity.lpRiskLevel === "CRITICAL") {
+    insights.push("🚨 CRITICAL: LP is UNLOCKED and UNBURNED - EXTREME RUG PULL RISK");
+    insights.push("⚠️ Only trade with money you can afford to lose completely");
+  } else if (analysis.liquidity.lpRiskLevel === "HIGH") {
+    insights.push("🔴 HIGH RISK: Insufficient LP protection - major rug pull vulnerability");
+    insights.push("⚠️ Use extreme caution - consider waiting for better LP protection");
+  }
   
   // Positive factors
   if (analysis.ownership.renounceable) {
@@ -1206,14 +1238,10 @@ function generateTraderInsights(analysis, riskPercentage) {
     insights.push("🔒 Low max tx/wallet limits may cause slippage on larger trades");
   }
 
-  if (!analysis.liquidity.lpLocked && analysis.liquidity.lpPercentBurned < 25) {
-    insights.push("⚠️ Low liquidity protection - rug pull risk");
-  }
-
   // Trading recommendations
-  if (riskPercentage < 25) {
+  if (riskPercentage < 25 && analysis.liquidity.lpRiskLevel === "LOW") {
     insights.push("📈 Suitable for swing trading - set stop losses at 15-20%");
-  } else if (riskPercentage < 40) {
+  } else if (riskPercentage < 40 && analysis.liquidity.lpRiskLevel !== "CRITICAL") {
     insights.push("⚖️ Medium risk - use tight stop losses (10%) and small position sizes");
   } else {
     insights.push("🚨 High risk - only for experienced traders with strict risk management");
@@ -1227,10 +1255,10 @@ function generateTraderInsights(analysis, riskPercentage) {
     insights.push(`🔥 High volume: ${analysis.activity.totalTransactions24h} transactions in 24h`);
   }
 
-  return insights.length > 0 ? insights.join("\n") : "No specific insights - DYOR";
+  return insights.length > 0 ? insights.join("\n") : "⚠️ No specific insights - CRITICAL: DYOR immediately";
 }
 
-// Enhanced report formatting with real data
+// FIXED: Enhanced report formatting with real supply data and proper LP warnings
 function formatAnalysisReport(analysis) {
   const { riskAssessment, tokenInfo, ownership, taxes, liquidity, holderAnalysis, 
           simulation, activity, security, contractAnalysis, pairCreationInfo } = analysis;
@@ -1240,18 +1268,40 @@ function formatAnalysisReport(analysis) {
       .map((h, i) => `${i + 1}. <code>${h.address.slice(0, 6)}...</code>: ${h.percent.toFixed(2)}%`)
       .join("\n") : "No holder data available";
 
-  // Format contract age
+  // FIXED: Format contract age
   let contractAge = "Unknown";
   if (pairCreationInfo && pairCreationInfo.timestamp) {
     const ageDays = liquidity.lpAgeDays || Math.floor((Date.now() / 1000 - Number(pairCreationInfo.timestamp)) / 86400);
     contractAge = `${ageDays} days`;
   }
 
-  // Format LP details
+  // FIXED: Format LP details with explicit risk warnings
   let lpDetails = liquidity.lpStatus;
-  if (liquidity.lpLocked) {
+  if (liquidity.lpRiskLevel === "CRITICAL") {
+    lpDetails = `🚨 ${liquidity.lpStatus}`;
+  } else if (liquidity.lpRiskLevel === "HIGH") {
+    lpDetails = `🔴 ${liquidity.lpStatus}`;
+  } else if (liquidity.lpLocked) {
     lpDetails += `\n   └─ ${liquidity.lockedAmount ? ethers.formatEther(liquidity.lockedAmount) : 'Unknown'} LP tokens locked`;
     lpDetails += `\n   └─ Unlocks: ${liquidity.unlockDate}`;
+  }
+
+  // FIXED: Format total supply properly
+  let formattedSupply = "Unknown";
+  if (tokenInfo.totalSupply && tokenInfo.decimals) {
+    try {
+      formattedSupply = ethers.formatUnits(tokenInfo.totalSupply, tokenInfo.decimals);
+      // Format large numbers nicely
+      if (parseFloat(formattedSupply) > 1000000) {
+        formattedSupply = (parseFloat(formattedSupply) / 1000000).toFixed(2) + "M";
+      } else if (parseFloat(formattedSupply) > 1000) {
+        formattedSupply = (parseFloat(formattedSupply) / 1000).toFixed(2) + "K";
+      }
+    } catch (e) {
+      formattedSupply = tokenInfo.totalSupply.toString();
+    }
+  } else if (tokenInfo.totalSupply) {
+    formattedSupply = tokenInfo.totalSupply.toString();
   }
 
   return [
@@ -1259,7 +1309,7 @@ function formatAnalysisReport(analysis) {
     "",
     `<b>📋 TOKEN OVERVIEW</b>`,
     `<code>${tokenInfo.name || 'Unknown'}</code> (<code>${tokenInfo.symbol || '???'}</code>)`,
-    `Total Supply: <code>${tokenInfo.totalSupply ? ethers.formatEther(tokenInfo.totalSupply) : 'Unknown'}</code>`,
+    `Total Supply: <code>${formattedSupply}</code>`, // FIXED: Proper supply formatting
     `Contract Age: ${contractAge}`,
     `Contract: ${contractAnalysis.isContract ? "✅ Deployed" : "❌ Not a contract"}`,
     `Verified: ${ownership.verified ? "✅ Verified Source Code" : "⚠️ Unverified"}`,
@@ -1276,7 +1326,8 @@ function formatAnalysisReport(analysis) {
     "",
     `<b>💧 LIQUIDITY</b>`,
     lpDetails,
-    `${liquidity.hasLiquidity ? "✅ Liquidity detected" : "❌ No liquidity found"}`,
+    `${liquidity.hasLiquidity ? "✅ Liquidity detected" : "❌ NO LIQUIDITY - CRITICAL"}`,
+    `${liquidity.lpRiskLevel === "LOW" ? "🟢 LOW RISK" : liquidity.lpRiskLevel === "MEDIUM" ? "🟡 MEDIUM RISK" : "🔴 HIGH/CRITICAL RISK"} LP Protection`,
     "",
     `<b>👥 HOLDER DISTRIBUTION</b>`,
     `${holderAnalysis.totalLiveHolders || 0} live holders`,
@@ -1311,13 +1362,20 @@ function formatAnalysisReport(analysis) {
     `<b>⚠️ RISK SUMMARY</b>`,
     `Overall Risk: <b>${riskAssessment.level}</b>`,
     `Risk Factors: ${riskAssessment.factors.length > 0 ? riskAssessment.factors.slice(0, 3).join(', ') : 'None detected'}${riskAssessment.factors.length > 3 ? '...' : ''}`,
-    `Recommendation: ${getTradingRecommendation(riskAssessment.riskPercentage)}`,
+    `Recommendation: ${getTradingRecommendation(riskAssessment.riskPercentage, liquidity.lpRiskLevel)}`,
     "",
     `<i>⚠️ Always DYOR - This analysis is for informational purposes only</i>`
   ].filter(line => line && line.trim() !== "").join("\n");
 }
 
-function getTradingRecommendation(riskPercentage) {
+function getTradingRecommendation(riskPercentage, lpRiskLevel) {
+  // FIXED: LP risk overrides general risk assessment
+  if (lpRiskLevel === "CRITICAL") {
+    return "🚨 EXTREME RISK - AVOID or use MINIMAL position size only";
+  } else if (lpRiskLevel === "HIGH") {
+    return "🔴 HIGH RISK - Only for experienced traders with strict risk management";
+  }
+  
   if (riskPercentage < 25) return "🟢 Safe for accumulation - consider long-term hold";
   if (riskPercentage < 40) return "🟢 Good for swing trading - set 15% stop loss";
   if (riskPercentage < 55) return "🟡 Trade with caution - use 10% stop loss, small positions";
@@ -1348,15 +1406,15 @@ function calculateRisk({ buyTax, sellTax, lpPercentBurned, holders }) {
   }
   if (lpPercentBurned < 50) {
     score += 2;
-    lpComment = "⚠️ Low burn/lock - liquidity can be removed.";
+    lpComment = "🚨 LOW BURN/LOCK - HIGH RUG PULL RISK."; // FIXED: More explicit warning
   }
   if (biggestHolder && biggestHolder.percent > 30) {
     score += 2;
     holderComment = `⚠️ Whale holds >${biggestHolder.percent.toFixed(2)}% supply.`;
   }
 
-  if (score >= 4) traderInsights = "High rug risk — trade cautiously.";
-  else if (score >= 2) traderInsights = "Moderate risk — DYOR before buying.";
+  if (score >= 4) traderInsights = "🚨 HIGH RUG RISK — AVOID OR TRADE EXTREMELY CAUTIOUSLY.";
+  else if (score >= 2) traderInsights = "⚠️ MODERATE RISK — DYOR BEFORE BUYING.";
 
   return {
     emoji: score >= 4 ? "🔴" : score >= 2 ? "🟡" : "🟢",
