@@ -407,23 +407,33 @@ async function getContractCreationTime(tokenAddress) {
       };
     }
     
-    // Fallback: Try address transactions to find creation
-    const txResponse = await axios.get(`${BASE_URL}/addresses/${tokenAddress.toLowerCase()}/transactions`, {
-      params: { filter: 'creation', limit: 1 },
+    // 🔥 FIXED: Use old API to get contract creation info (deployer and tx hash)
+    const oldBaseUrl = BASE_URL.replace('/v2', '');
+    const creationResponse = await axios.get(`${oldBaseUrl}?module=contract&action=getcontractcreation&contractaddresses=${tokenAddress.toLowerCase()}`, {
       timeout: 5000
     });
     
-    if (txResponse.data && txResponse.data.items && txResponse.data.items.length > 0) {
-      const creationTx = txResponse.data.items[0];
-      deployer = creationTx.from_hash;
-      const block = await provider.getBlock(creationTx.block_number);
-      console.log(`✅ Found creation via tx: block ${creationTx.block_number}, timestamp ${block.timestamp}, deployer ${deployer}`);
-      return {
-        blockNumber: creationTx.block_number,
-        timestamp: block.timestamp,
-        ageHours: Math.floor((Date.now() / 1000 - Number(block.timestamp)) / 3600),
-        deployer
-      };
+    if (creationResponse.data && creationResponse.data.status === '1' && creationResponse.data.result && creationResponse.data.result.length > 0) {
+      const creationInfo = creationResponse.data.result[0];
+      deployer = creationInfo.contractcreator;
+      const txHash = creationInfo.tx_hash;
+      
+      // Get block number from tx using v2 API
+      const txResponse = await axios.get(`${BASE_URL}/transactions/${txHash.toLowerCase()}`, {
+        timeout: 5000
+      });
+      
+      if (txResponse.data && txResponse.data.block_number) {
+        const blockNumber = parseInt(txResponse.data.block_number);
+        const block = await provider.getBlock(blockNumber);
+        console.log(`✅ Found creation via old API: block ${blockNumber}, timestamp ${block.timestamp}, deployer ${deployer}`);
+        return {
+          blockNumber,
+          timestamp: block.timestamp,
+          ageHours: Math.floor((Date.now() / 1000 - Number(block.timestamp)) / 3600),
+          deployer
+        };
+      }
     }
     
     // Final fallback: Estimate from recent blocks
