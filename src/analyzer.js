@@ -6,8 +6,10 @@ import { createRequire } from "module";
 const require = createRequire(import.meta.url);
 const lpAbi = require("./abi/LP.json");
 const lockerAbi = require("./abi/Locker.json");
+const routerAbi = require("./abi/Router.json"); // <-- NEW: import router ABI
 
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
+const ROUTER_ADDRESS = process.env.ROUTER_ADDRESS; // <-- Make sure this is set in .env
 const FACTORY_ADDRESS = process.env.FACTORY_ADDRESS;
 const LOCKER_ADDRESS = process.env.LOCKER_ADDRESS;
 const BASE_URL = process.env.BLOCKSCOUT_API || "https://explorer.beschyperchain.com/api/v2";
@@ -74,6 +76,7 @@ export async function analyzeToken(tokenAddress) {
     let lpStatus = "⚠️ LP Not Locked or Burned";
     let lpPercentBurned = 0;
     let lpPair = null;
+    let pairedToken = null;
     try {
       lpPair = await tokenContract.pair();
       if (lpPair && lpPair !== ethers.ZeroAddress) {
@@ -82,6 +85,12 @@ export async function analyzeToken(tokenAddress) {
 
         const deadBalance = await lp.balanceOf("0x000000000000000000000000000000000000dEaD");
         lpPercentBurned = lpSupply > 0n ? Number((deadBalance * 10000n) / lpSupply) / 100 : 0;
+
+        pairedToken = await lp.token0();
+        const token1 = await lp.token1();
+        if (pairedToken.toLowerCase() === tokenAddress.toLowerCase()) {
+          pairedToken = token1;
+        }
 
         if (lpPercentBurned > 0) {
           lpStatus = `🔥 LP Burned (${lpPercentBurned.toFixed(2)}%)`;
@@ -99,13 +108,8 @@ export async function analyzeToken(tokenAddress) {
       console.log("LP check failed:", err.message);
     }
 
-    // --- 5. Top Holders ---
-    const holders = await getTopHolders(
-      tokenAddress,
-      50,
-      tokenInfo.totalSupply,
-      tokenInfo.decimals
-    );
+    // --- 5. Top Holders (limit to 7 for readability) ---
+    const holders = await getTopHolders(tokenAddress, 50, tokenInfo.totalSupply, tokenInfo.decimals);
     const topHoldersDisplay = holders.slice(0, 7);
     let holdersText = topHoldersDisplay.length
       ? topHoldersDisplay.map((h) => `• ${h.label || `<code>${h.address}</code>`} (${h.percent.toFixed(2)}%)`).join("\n")
@@ -135,40 +139,32 @@ export async function analyzeToken(tokenAddress) {
       }
     }
 
-    // --- 7. Honeypot Simulation (DEX-aware) ---
+    // --- 7. Honeypot Simulation with Router Fallback ---
     let honeypotRisk = "✅ Sell simulation succeeded";
     try {
       const testWallet = ethers.Wallet.createRandom().address;
       await provider.call({
         to: tokenAddress,
-        data: tokenContract.interface.encodeFunctionData("transfer", [
-          testWallet,
-          1n
-        ])
+        data: tokenContract.interface.encodeFunctionData("transfer", [testWallet, 1n])
       });
     } catch (transferErr) {
-      console.log("Direct transfer failed, trying DEX swap simulation...");
+      console.log("Direct transfer failed, trying Router swap simulation...");
       try {
-        if (lpPair) {
-          const lp = new ethers.Contract(lpPair, lpAbi, provider);
-          const token0 = await lp.token0();
-          const token1 = await lp.token1();
-          const path = [tokenAddress, token0 === tokenAddress ? token1 : token0];
-          // Minimal encoded data for a swap simulation (no actual execution)
-          const swapIface = new ethers.Interface([
-            "function swapExactTokensForTokensSupportingFeeOnTransferTokens(uint amountIn, uint amountOutMin, address[] path, address to, uint deadline)"
-          ]);
-          const callData = swapIface.encodeFunctionData(
+        if (ROUTER_ADDRESS && pairedToken) {
+          const router = new ethers.Contract(ROUTER_ADDRESS, routerAbi, provider);
+          const path = [tokenAddress, pairedToken];
+          const deadline = Math.floor(Date.now() / 1000) + 60;
+          const data = router.interface.encodeFunctionData(
             "swapExactTokensForTokensSupportingFeeOnTransferTokens",
-            [ethers.parseUnits("1", tokenInfo.decimals), 0, path, testWallet, Math.floor(Date.now() / 1000) + 60]
+            [ethers.parseUnits("1", tokenInfo.decimals), 0, path, ethers.ZeroAddress, deadline]
           );
-          await provider.call({ to: lpPair, data: callData });
-          honeypotRisk = "✅ Swap simulation passed (DEX sell possible)";
+          await provider.call({ to: ROUTER_ADDRESS, data });
+          honeypotRisk = "✅ Router swap simulation passed";
         } else {
-          honeypotRisk = "⚠️ Could not find LP pair — cannot simulate sell.";
+          honeypotRisk = "⚠️ No router/pair found — cannot simulate sell.";
         }
       } catch (dexErr) {
-        honeypotRisk = "🛑 Possible Honeypot — Swap simulation reverted!";
+        honeypotRisk = "🛑 Possible Honeypot — Router swap reverted!";
       }
     }
 
