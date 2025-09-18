@@ -5,7 +5,7 @@ const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
 const BASE_URL = process.env.BLOCKSCOUT_API || "https://explorer.beschyperchain.com/api/v2";
 
 /**
- * Fetch token info from RPC with safe fallbacks.
+ * Fetch token info safely from blockchain.
  */
 export async function getTokenInfo(tokenAddress) {
   const erc20Abi = [
@@ -14,7 +14,6 @@ export async function getTokenInfo(tokenAddress) {
     "function decimals() view returns (uint8)",
     "function totalSupply() view returns (uint256)"
   ];
-
   const token = new ethers.Contract(tokenAddress, erc20Abi, provider);
 
   const [name, symbol, decimals, totalSupply] = await Promise.all([
@@ -33,10 +32,10 @@ export async function getTokenInfo(tokenAddress) {
 }
 
 /**
- * Fetch top token holders from BlockScout API with pagination.
- * Normalizes address field, tags LP/Burn addresses, sorts by balance.
+ * Fetch top token holders from BlockScout API.
+ * Auto-tags LP, Burn wallets, and limits result set.
  */
-export async function getTopHolders(tokenAddress, limit = 10, totalSupply, decimals) {
+export async function getTopHolders(tokenAddress, limit = 7, totalSupply, decimals) {
   try {
     const url = `${BASE_URL}/tokens/${tokenAddress}/holders?page=1&limit=${limit}`;
     const res = await axios.get(url);
@@ -50,8 +49,7 @@ export async function getTopHolders(tokenAddress, limit = 10, totalSupply, decim
       return [];
     }
 
-    const holders = res.data.items.map((h) => {
-      // Normalize address regardless of format
+    return res.data.items.map((h) => {
       let addr =
         typeof h.address === "string"
           ? h.address
@@ -60,33 +58,33 @@ export async function getTopHolders(tokenAddress, limit = 10, totalSupply, decim
       const balance = Number(ethers.formatUnits(h.value || "0", decimals || 18));
       const percent = totalSupply > 0 ? (balance / totalSupply) * 100 : 0;
 
-      let label = addr;
+      // --- Build label with emojis + clickable link ---
+      let label = `<a href="${BASE_URL.replace("/api/v2", "")}/address/${addr}" target="_blank">${addr}</a>`;
+
       if (addr.toLowerCase() === "0x000000000000000000000000000000000000dead") {
         label = "🔥 Burn Address";
       }
       if (h.name && typeof h.name === "string" && h.name.toLowerCase().includes("sushi")) {
         label = "🍣 SushiSwap LP Token";
       }
-      if (h.is_contract) {
+      if (h.is_contract && addr.toLowerCase() !== "0x000000000000000000000000000000000000dead") {
         label += " [Contract]";
       }
 
       return {
-        address: label,
-        rawAddress: addr,
+        address: addr,
+        label,
         balance,
         percent
       };
-    });
-
-    return holders.sort((a, b) => b.balance - a.balance);
+    }).sort((a, b) => b.balance - a.balance);
   } catch (err) {
     console.error("❌ getTopHolders failed:", err.message);
     return [];
   }
 }
 
-/** Safe call wrapper to avoid crashing on view call errors */
+/** Safe view call wrapper */
 async function safeCall(fn, fallback) {
   try {
     return await fn();
