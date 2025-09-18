@@ -8,7 +8,7 @@ import { getTopHolders, detectDevSells } from "./holders.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ✅ Load ABIs safely for Node 16+ (no experimental flags needed)
+// ✅ Load ABIs safely (no assert required)
 const erc20Abi = JSON.parse(fs.readFileSync(path.join(__dirname, "abi", "ERC20.json"), "utf8"));
 const lpAbi = JSON.parse(fs.readFileSync(path.join(__dirname, "abi", "LP.json"), "utf8"));
 const lockerAbi = JSON.parse(fs.readFileSync(path.join(__dirname, "abi", "Locker.json"), "utf8"));
@@ -27,14 +27,12 @@ export async function analyzeToken(tokenAddress) {
     tryRead(() => token.owner())
   ]);
 
-  // Tax checks (if functions exist)
+  // Tax checks (if they exist)
   const buyTax = await tryRead(() => token.buyTax?.());
   const sellTax = await tryRead(() => token.sellTax?.());
 
-  // Try to find LP pair from factory
-  let lpInfo = "❌ LP Not Found";
+  // Try to find LP pair
   let lpAddress = null;
-
   try {
     const factory = new ethers.Contract(process.env.FACTORY_ADDRESS, [
       "function allPairsLength() view returns (uint256)",
@@ -60,8 +58,12 @@ export async function analyzeToken(tokenAddress) {
     console.log("⚠️ LP pair scan failed:", err);
   }
 
+  let lpInfo = "❌ LP Not Found";
+  let lpBurnPercent = 0;
   if (lpAddress) {
-    lpInfo = await analyzeLP(lpAddress);
+    const { status, burnPercent } = await analyzeLP(lpAddress);
+    lpInfo = status;
+    lpBurnPercent = burnPercent;
   }
 
   // Holders + Dev sell detection
@@ -76,41 +78,61 @@ export async function analyzeToken(tokenAddress) {
     buyTax,
     sellTax,
     lpInfo,
+    lpBurnPercent,
     holders,
     devSells
   });
 }
 
 async function analyzeLP(lpAddress) {
-  const locker = new ethers.Contract(process.env.LOCKER_ADDRESS, lockerAbi, provider);
+  const lp = new ethers.Contract(lpAddress, lpAbi, provider);
+  const burnAddresses = [
+    "0x000000000000000000000000000000000000dEaD",
+    "0x0000000000000000000000000000000000000000"
+  ];
 
   try {
-    const events = await locker.queryFilter("Locked", 0, "latest");
-    const lock = events.find(
-      (e) => e.args.token.toLowerCase() === lpAddress.toLowerCase()
-    );
+    const totalSupply = await lp.totalSupply();
 
+    for (const addr of burnAddresses) {
+      const bal = await lp.balanceOf(addr);
+      if (bal > 0n) {
+        const percent = Number((bal * 10000n) / totalSupply) / 100;
+        return { status: `🔥 LP Burned (${percent.toFixed(2)}%)`, burnPercent: percent };
+      }
+    }
+  } catch (err) {
+    console.log("LP burn check failed:", err);
+  }
+
+  // Locker check fallback
+  try {
+    const locker = new ethers.Contract(process.env.LOCKER_ADDRESS, lockerAbi, provider);
+    const events = await locker.queryFilter("Locked", 0, "latest");
+    const lock = events.find(e => e.args.token.toLowerCase() === lpAddress.toLowerCase());
     if (lock) {
       const unlockTime = new Date(Number(lock.args.unlockTime) * 1000);
-      return `✅ Locked until <b>${unlockTime.toUTCString()}</b>`;
+      return { status: `✅ Locked until <b>${unlockTime.toUTCString()}</b>`, burnPercent: 0 };
     }
   } catch (err) {
     console.log("Locker query failed:", err);
   }
 
-  // Check if LP is burned
-  const lp = new ethers.Contract(lpAddress, lpAbi, provider);
-  const dead = "0x000000000000000000000000000000000000dEaD";
-  const burned = await lp.balanceOf(dead);
-
-  if (burned > 0n) return "🔥 LP Burned";
-  return "⚠️ LP Not Locked or Burned";
+  return { status: "⚠️ LP Not Locked or Burned", burnPercent: 0 };
 }
 
-function formatReport({ name, symbol, totalSupply, owner, buyTax, sellTax, lpInfo, holders, devSells }) {
+function formatReport({ name, symbol, totalSupply, owner, buyTax, sellTax, lpInfo, lpBurnPercent, holders, devSells }) {
+  // Determine risk rating
+  let riskLevel = "🟢 SAFE";
+  if (lpInfo.includes("⚠️") || (holders[0]?.percent ?? 0) > 50 || devSells.length > 0) {
+    riskLevel = "🔴 DANGER";
+  } else if (lpBurnPercent < 50 && lpBurnPercent > 0) {
+    riskLevel = "🟡 CAUTION";
+  }
+
   const topHolders =
     holders.length > 0
-      ? holders.map((h) => `• ${h.address} (${h.percent.toFixed(2)}%)`).join("\n")
+      ? holders.map((h) => `• <code>${h.address}</code> (${h.percent.toFixed(2)}%)`).join("\n")
       : "N/A";
 
   const devSellNote =
@@ -119,6 +141,8 @@ function formatReport({ name, symbol, totalSupply, owner, buyTax, sellTax, lpInf
       : "✅ No dev sells in last 24h";
 
   return `
+<b>${riskLevel}</b>
+
 <b>${name ?? "Unknown Token"} (${symbol ?? "?"})</b>
 
 <b>Supply:</b> ${totalSupply ? Number(totalSupply) / 1e18 : "N/A"}
