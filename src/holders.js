@@ -3,7 +3,7 @@ import { ethers } from "ethers";
 export async function getTopHolders(token, provider) {
   try {
     const latestBlock = await provider.getBlockNumber();
-    const fromBlock = Math.max(latestBlock - 5000, 0); // safe lower bound
+    const fromBlock = Math.max(latestBlock - 5000, 0);
 
     const transferTopic = ethers.id("Transfer(address,address,uint256)");
     const logs = await provider.getLogs({
@@ -13,26 +13,43 @@ export async function getTopHolders(token, provider) {
       topics: [transferTopic]
     });
 
-    if (!logs.length) return []; // no transfers yet
+    if (!logs.length) return [];
 
-    const balances = {};
+    // Collect unique addresses from recent logs
+    const uniqueAddresses = new Set();
     for (const log of logs) {
       const { args } = decodeTransfer(log);
-      if (args.from !== ethers.ZeroAddress) {
-        balances[args.from] = (balances[args.from] || 0n) - args.value;
-      }
-      balances[args.to] = (balances[args.to] || 0n) + args.value;
+      if (args.from !== ethers.ZeroAddress) uniqueAddresses.add(args.from);
+      if (args.to !== ethers.ZeroAddress) uniqueAddresses.add(args.to);
     }
 
-    const sorted = Object.entries(balances)
-      .filter(([addr, bal]) => bal > 0n)
-      .sort((a, b) => (b[1] > a[1] ? 1 : -1))
-      .slice(0, 5);
+    // Now query actual balances on-chain
+    const tokenContract = new ethers.Contract(
+      token,
+      [
+        "function balanceOf(address) view returns (uint256)",
+        "function totalSupply() view returns (uint256)"
+      ],
+      provider
+    );
 
-    const total = sorted.reduce((acc, [, b]) => acc + b, 0n) || 1n;
-    return sorted.map(([addr, bal]) => ({
-      address: addr,
-      percent: Number((bal * 10000n) / total) / 100
+    const totalSupply = await tokenContract.totalSupply();
+    const holders = [];
+
+    for (const addr of uniqueAddresses) {
+      const bal = await tokenContract.balanceOf(addr);
+      if (bal > 0n) {
+        holders.push({ address: addr, balance: bal });
+      }
+    }
+
+    // Sort by balance desc
+    holders.sort((a, b) => (b.balance > a.balance ? 1 : -1));
+
+    // Take top 5 and compute percentages
+    return holders.slice(0, 5).map((h) => ({
+      address: h.address,
+      percent: Number((h.balance * 10000n) / totalSupply) / 100
     }));
   } catch (e) {
     console.error("Error in getTopHolders:", e);
@@ -53,7 +70,6 @@ export async function detectDevSells(token, provider) {
       topics: [transferTopic]
     });
 
-    // In real production: filter by known dev wallet(s)
     return logs.filter((log) => {
       const { args } = decodeTransfer(log);
       return args.from !== ethers.ZeroAddress;
