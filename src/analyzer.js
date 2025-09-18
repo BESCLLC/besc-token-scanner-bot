@@ -1446,10 +1446,12 @@ function formatAnalysisReport(analysis) {
       .join("\n") : "No holder data available";
 
   let contractAge = "Unknown";
-  if (pairCreationInfo && pairCreationInfo.timestamp) {
-    const ageDays = liquidity.lpAgeDays || Math.floor((Date.now() / 1000 - Number(pairCreationInfo.timestamp)) / 86400);
-    contractAge = `${ageDays} days`;
-  }
+if (pairCreationInfo && pairCreationInfo.timestamp) {
+  const ageHours =
+    liquidity.lpAgeHours ||
+    Math.floor((Date.now() / 1000 - Number(pairCreationInfo.timestamp)) / 3600);
+  contractAge = `${ageHours} hours`;
+}
 
   let lpDetails = liquidity.lpStatus;
   if (liquidity.lpRiskLevel === "CRITICAL") {
